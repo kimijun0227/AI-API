@@ -188,7 +188,8 @@ class Handler(BaseHTTPRequestHandler):
             if exc.code == 429:
                 self.send_json(429, error_payload("rate_limit", "Groq 요청 한도에 도달했습니다. 잠시 후 다시 시도해 주세요.", remaining))
             else:
-                self.send_json(502, error_payload("server_error", "AI 제공자와 통신하는 중 문제가 생겼습니다.", remaining))
+                print(f"Groq returned HTTP {exc.code}", flush=True)
+                self.send_json(502, error_payload("server_error", f"AI 제공자 통신 오류 (Groq HTTP {exc.code})", remaining))
         except (URLError, TimeoutError, KeyError, IndexError, ValueError, json.JSONDecodeError):
             self.send_json(502, error_payload("server_error", "AI 답변을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.", remaining))
 
