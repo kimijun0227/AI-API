@@ -10,6 +10,7 @@ import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from xml.sax.saxutils import escape
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
@@ -23,9 +24,16 @@ GLOBAL_DAILY_LIMIT = int(os.getenv("GLOBAL_DAILY_LIMIT", "1000"))
 GLOBAL_RPM_LIMIT = int(os.getenv("GLOBAL_RPM_LIMIT", "20"))
 MAX_QUESTION_CHARS = int(os.getenv("MAX_QUESTION_CHARS", "30"))
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "160"))
+TTS_DAILY_LIMIT = int(os.getenv("TTS_DAILY_LIMIT", "10"))
+TTS_GLOBAL_DAILY_LIMIT = int(os.getenv("TTS_GLOBAL_DAILY_LIMIT", "1000"))
+TTS_GLOBAL_RPM_LIMIT = int(os.getenv("TTS_GLOBAL_RPM_LIMIT", "20"))
+MAX_TTS_CHARS = int(os.getenv("MAX_TTS_CHARS", "2000"))
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "").strip()
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "").strip()
+AZURE_SPEECH_VOICE = "ko-KR-InJoonNeural"
 DB_LOCK = threading.Lock()
 INSTALL_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
@@ -60,6 +68,16 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS global_minute (
                 minute TEXT PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS tts_user_daily (
+                user_id TEXT NOT NULL, day TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, day)
+            );
+            CREATE TABLE IF NOT EXISTS tts_global_daily (
+                day TEXT PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS tts_global_minute (
+                minute TEXT PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0
+            );
         """)
 
 
@@ -92,6 +110,33 @@ def reserve_request(user_id: str) -> tuple[str | None, int]:
         return None, max(0, USER_DAILY_LIMIT - user_used - 1)
 
 
+def reserve_tts(user_id: str) -> str | None:
+    """Bound Azure speech usage per install, globally per day, and per minute."""
+    today, minute = day_key(), minute_key()
+    with DB_LOCK, connect_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT OR IGNORE INTO tts_user_daily(user_id, day) VALUES (?, ?)", (user_id, today))
+        conn.execute("INSERT OR IGNORE INTO tts_global_daily(day) VALUES (?)", (today,))
+        conn.execute("INSERT OR IGNORE INTO tts_global_minute(minute) VALUES (?)", (minute,))
+        user_used = conn.execute("SELECT used FROM tts_user_daily WHERE user_id=? AND day=?", (user_id, today)).fetchone()[0]
+        global_used = conn.execute("SELECT used FROM tts_global_daily WHERE day=?", (today,)).fetchone()[0]
+        minute_used = conn.execute("SELECT used FROM tts_global_minute WHERE minute=?", (minute,)).fetchone()[0]
+        if user_used >= TTS_DAILY_LIMIT:
+            conn.rollback()
+            return "user_limit"
+        if global_used >= TTS_GLOBAL_DAILY_LIMIT:
+            conn.rollback()
+            return "global_limit"
+        if minute_used >= TTS_GLOBAL_RPM_LIMIT:
+            conn.rollback()
+            return "rate_limit"
+        conn.execute("UPDATE tts_user_daily SET used=used+1 WHERE user_id=? AND day=?", (user_id, today))
+        conn.execute("UPDATE tts_global_daily SET used=used+1 WHERE day=?", (today,))
+        conn.execute("UPDATE tts_global_minute SET used=used+1 WHERE minute=?", (minute,))
+        conn.commit()
+        return None
+
+
 def error_payload(code: str, message: str, remaining: int = -1, limit: int = USER_DAILY_LIMIT) -> dict:
     return {"error": code, "message": message, "remaining": remaining, "limit": limit}
 
@@ -114,11 +159,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            self.send_json(200, {"ok": True})
+            self.send_json(200, {"ok": True, "tts_configured": bool(AZURE_SPEECH_KEY and AZURE_SPEECH_REGION)})
         else:
             self.send_json(404, {"error": "not_found", "message": "요청한 주소를 찾을 수 없습니다."})
 
     def do_POST(self) -> None:
+        if self.path == "/speak":
+            self.do_speak()
+            return
         if self.path != "/ask":
             self.send_json(404, {"error": "not_found", "message": "요청한 주소를 찾을 수 없습니다."})
             return
@@ -222,6 +270,79 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(502, error_payload("server_error", f"Groq HTTP {exc.code}{detail}", remaining))
         except (URLError, TimeoutError, KeyError, IndexError, ValueError, json.JSONDecodeError):
             self.send_json(502, error_payload("server_error", "AI 답변을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.", remaining))
+
+    def do_speak(self) -> None:
+        if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
+            self.send_json(503, error_payload("tts_not_configured", "서버에 Azure Speech 설정이 없습니다."))
+            return
+
+        install_id = self.headers.get("X-Install-Id", "").strip()
+        if not INSTALL_ID_RE.fullmatch(install_id):
+            self.send_json(400, error_payload("invalid_user", "앱 식별 정보가 올바르지 않습니다."))
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 1 or length > 32_768:
+                raise ValueError("invalid content length")
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            self.send_json(400, error_payload("invalid_request", "요청 형식을 확인해 주세요."))
+            return
+
+        text = body.get("text") if isinstance(body, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            self.send_json(400, error_payload("invalid_request", "읽을 문장이 비어 있습니다."))
+            return
+        text = text.strip()
+        if len(text) > MAX_TTS_CHARS:
+            self.send_json(400, error_payload("too_long", f"음성으로 읽을 문장은 {MAX_TTS_CHARS}자까지만 가능합니다."))
+            return
+
+        try:
+            denial = reserve_tts(install_id)
+        except sqlite3.Error:
+            self.send_json(503, error_payload("server_error", "사용량 저장소에 문제가 생겼습니다."))
+            return
+        if denial == "user_limit":
+            self.send_json(429, error_payload("tts_user_limit", "오늘 음성 재생 횟수를 모두 사용했습니다."))
+            return
+        if denial == "global_limit":
+            self.send_json(429, error_payload("tts_global_limit", "오늘 음성 사용량이 모두 소진되었습니다."))
+            return
+        if denial == "rate_limit":
+            self.send_json(429, error_payload("rate_limit", "음성 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요."))
+            return
+
+        ssml = (
+            "<speak version='1.0' xml:lang='ko-KR'>"
+            f"<voice xml:lang='ko-KR' name='{AZURE_SPEECH_VOICE}'>{escape(text)}</voice>"
+            "</speak>"
+        ).encode("utf-8")
+        url = f"https://{AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
+        req = Request(url, data=ssml, headers={
+            "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
+            "Content-Type": "application/ssml+xml",
+            "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+            "User-Agent": "UnityAI-AzureTTS/1.0",
+        }, method="POST")
+        try:
+            with urlopen(req, timeout=45) as response:
+                audio = response.read()
+            if not audio:
+                raise ValueError("empty speech response")
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Content-Length", str(len(audio)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(audio)
+        except HTTPError as exc:
+            # Do not expose the Azure response body, which can contain account details.
+            print(f"Azure Speech HTTP {exc.code}", flush=True)
+            self.send_json(502, error_payload("tts_provider_error", f"Azure Speech 요청이 실패했습니다 (HTTP {exc.code})."))
+        except (URLError, TimeoutError, OSError, ValueError) as exc:
+            print(f"Azure Speech request failed: {type(exc).__name__}", flush=True)
+            self.send_json(502, error_payload("tts_provider_error", "Azure 음성을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요."))
 
 
 if __name__ == "__main__":
