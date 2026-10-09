@@ -176,6 +176,9 @@ class Handler(BaseHTTPRequestHandler):
         req = Request(GROQ_URL, data=json.dumps(payload).encode("utf-8"), headers={
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json",
+            # Groq's Cloudflare edge can reject urllib's default Python-urllib UA
+            # with HTTP 403 / error code 1010. Identify this API client explicitly.
+            "User-Agent": "UnityAI-Groq-Server/1.0",
         }, method="POST")
         try:
             with urlopen(req, timeout=30) as response:
