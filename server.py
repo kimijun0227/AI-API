@@ -7,13 +7,14 @@ import re
 import sqlite3
 import threading
 import time
+import asyncio
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from xml.sax.saxutils import escape
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
+import edge_tts
 
 
 ROOT = Path(__file__).resolve().parent
@@ -31,9 +32,7 @@ MAX_TTS_CHARS = int(os.getenv("MAX_TTS_CHARS", "2000"))
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "").strip()
-AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "").strip()
-AZURE_SPEECH_VOICE = "ko-KR-InJoonNeural"
+TTS_VOICE = "ko-KR-InJoonNeural"
 DB_LOCK = threading.Lock()
 INSTALL_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
@@ -159,7 +158,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            self.send_json(200, {"ok": True, "tts_configured": bool(AZURE_SPEECH_KEY and AZURE_SPEECH_REGION)})
+            self.send_json(200, {"ok": True, "tts_configured": True, "tts_provider": "edge-tts"})
         else:
             self.send_json(404, {"error": "not_found", "message": "요청한 주소를 찾을 수 없습니다."})
 
@@ -272,10 +271,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(502, error_payload("server_error", "AI 답변을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.", remaining))
 
     def do_speak(self) -> None:
-        if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
-            self.send_json(503, error_payload("tts_not_configured", "서버에 Azure Speech 설정이 없습니다."))
-            return
-
         install_id = self.headers.get("X-Install-Id", "").strip()
         if not INSTALL_ID_RE.fullmatch(install_id):
             self.send_json(400, error_payload("invalid_user", "앱 식별 정보가 올바르지 않습니다."))
@@ -313,21 +308,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(429, error_payload("rate_limit", "음성 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요."))
             return
 
-        ssml = (
-            "<speak version='1.0' xml:lang='ko-KR'>"
-            f"<voice xml:lang='ko-KR' name='{AZURE_SPEECH_VOICE}'>{escape(text)}</voice>"
-            "</speak>"
-        ).encode("utf-8")
-        url = f"https://{AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
-        req = Request(url, data=ssml, headers={
-            "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
-            "Content-Type": "application/ssml+xml",
-            "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
-            "User-Agent": "UnityAI-AzureTTS/1.0",
-        }, method="POST")
         try:
-            with urlopen(req, timeout=45) as response:
-                audio = response.read()
+            audio = asyncio.run(self.generate_edge_speech(text))
             if not audio:
                 raise ValueError("empty speech response")
             self.send_response(200)
@@ -337,12 +319,20 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(audio)
         except HTTPError as exc:
-            # Do not expose the Azure response body, which can contain account details.
-            print(f"Azure Speech HTTP {exc.code}", flush=True)
-            self.send_json(502, error_payload("tts_provider_error", f"Azure Speech 요청이 실패했습니다 (HTTP {exc.code})."))
-        except (URLError, TimeoutError, OSError, ValueError) as exc:
-            print(f"Azure Speech request failed: {type(exc).__name__}", flush=True)
-            self.send_json(502, error_payload("tts_provider_error", "Azure 음성을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요."))
+            print(f"Edge TTS HTTP error {exc.code}", flush=True)
+            self.send_json(502, error_payload("tts_provider_error", "음성 서비스 요청이 실패했습니다. 잠시 후 다시 시도해 주세요."))
+        except Exception as exc:
+            print(f"Edge TTS request failed: {type(exc).__name__}", flush=True)
+            self.send_json(502, error_payload("tts_provider_error", "음성을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요."))
+
+    @staticmethod
+    async def generate_edge_speech(text: str) -> bytes:
+        communicate = edge_tts.Communicate(text, TTS_VOICE)
+        chunks = []
+        async for chunk in communicate.stream():
+            if chunk.get("type") == "audio":
+                chunks.append(chunk["data"])
+        return b"".join(chunks)
 
 
 if __name__ == "__main__":
