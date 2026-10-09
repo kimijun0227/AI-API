@@ -188,8 +188,25 @@ class Handler(BaseHTTPRequestHandler):
             if exc.code == 429:
                 self.send_json(429, error_payload("rate_limit", "Groq 요청 한도에 도달했습니다. 잠시 후 다시 시도해 주세요.", remaining))
             else:
-                print(f"Groq returned HTTP {exc.code}", flush=True)
-                self.send_json(502, error_payload("server_error", f"AI 제공자 통신 오류 (Groq HTTP {exc.code})", remaining))
+                # Return only Groq's structured error code/message for diagnosis.
+                # Do not log the request, headers, or API key.
+                detail = ""
+                try:
+                    provider_error = json.loads(exc.read().decode("utf-8")).get("error", {})
+                    if isinstance(provider_error, dict):
+                        code = str(provider_error.get("code") or provider_error.get("type") or "")
+                        message = str(provider_error.get("message") or "")
+                        if GROQ_API_KEY:
+                            message = message.replace(GROQ_API_KEY, "[redacted]")
+                        message = " ".join(message.split())[:240]
+                        if code:
+                            detail += f" [{code}]"
+                        if message:
+                            detail += f" {message}"
+                except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError):
+                    pass
+                print(f"Groq HTTP {exc.code}{detail}", flush=True)
+                self.send_json(502, error_payload("server_error", f"Groq HTTP {exc.code}{detail}", remaining))
         except (URLError, TimeoutError, KeyError, IndexError, ValueError, json.JSONDecodeError):
             self.send_json(502, error_payload("server_error", "AI 답변을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.", remaining))
 
