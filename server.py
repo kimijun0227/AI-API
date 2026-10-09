@@ -188,23 +188,33 @@ class Handler(BaseHTTPRequestHandler):
             if exc.code == 429:
                 self.send_json(429, error_payload("rate_limit", "Groq 요청 한도에 도달했습니다. 잠시 후 다시 시도해 주세요.", remaining))
             else:
-                # Return only Groq's structured error code/message for diagnosis.
-                # Do not log the request, headers, or API key.
+                # Capture a short, sanitized provider response so permission errors
+                # can be diagnosed without logging the request, headers, or API key.
                 detail = ""
+                raw_body = ""
                 try:
-                    provider_error = json.loads(exc.read().decode("utf-8")).get("error", {})
+                    raw_body = exc.read().decode("utf-8", errors="replace")
+                    parsed = json.loads(raw_body)
+                    provider_error = parsed.get("error", parsed) if isinstance(parsed, dict) else parsed
                     if isinstance(provider_error, dict):
                         code = str(provider_error.get("code") or provider_error.get("type") or "")
-                        message = str(provider_error.get("message") or "")
-                        if GROQ_API_KEY:
-                            message = message.replace(GROQ_API_KEY, "[redacted]")
-                        message = " ".join(message.split())[:240]
+                        message = str(provider_error.get("message") or provider_error.get("detail") or "")
                         if code:
                             detail += f" [{code}]"
                         if message:
                             detail += f" {message}"
+                    elif provider_error:
+                        detail = f" {provider_error}"
                 except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError):
-                    pass
+                    detail = f" {raw_body}"
+                if not detail and raw_body:
+                    detail = f" {raw_body}"
+                if GROQ_API_KEY:
+                    detail = detail.replace(GROQ_API_KEY, "[redacted]")
+                detail = " ".join(detail.split())[:360]
+                request_id = exc.headers.get("x-request-id", "") if exc.headers else ""
+                if request_id and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id):
+                    detail += f" (request_id={request_id})"
                 print(f"Groq HTTP {exc.code}{detail}", flush=True)
                 self.send_json(502, error_payload("server_error", f"Groq HTTP {exc.code}{detail}", remaining))
         except (URLError, TimeoutError, KeyError, IndexError, ValueError, json.JSONDecodeError):
