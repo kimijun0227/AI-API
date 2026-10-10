@@ -373,8 +373,29 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json(200, {"text": transcript.strip()})
         except HTTPError as exc:
-            print(f"Groq transcription HTTP {exc.code}", flush=True)
-            self.send_json(502, error_payload("transcription_error", f"음성 인식 서비스 오류 (Groq HTTP {exc.code})"))
+            detail = ""
+            raw_body = ""
+            try:
+                raw_body = exc.read().decode("utf-8", errors="replace")
+                parsed = json.loads(raw_body)
+                provider_error = parsed.get("error", parsed) if isinstance(parsed, dict) else parsed
+                if isinstance(provider_error, dict):
+                    code = str(provider_error.get("code") or provider_error.get("type") or "")
+                    message = str(provider_error.get("message") or provider_error.get("detail") or "")
+                    detail = " ".join(part for part in (f"[{code}]" if code else "", message) if part)
+                elif provider_error:
+                    detail = str(provider_error)
+            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError):
+                detail = raw_body
+            if GROQ_API_KEY:
+                detail = detail.replace(GROQ_API_KEY, "[redacted]")
+            detail = " ".join(detail.split())[:320]
+            request_id = exc.headers.get("x-request-id", "") if exc.headers else ""
+            if request_id and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id):
+                detail += f" (request_id={request_id})"
+            print(f"Groq transcription HTTP {exc.code}{(' ' + detail) if detail else ''}", flush=True)
+            message = f"음성 인식 서비스 오류 (Groq HTTP {exc.code}{(' ' + detail) if detail else ''})"
+            self.send_json(502, error_payload("transcription_error", message))
         except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError):
             self.send_json(502, error_payload("transcription_error", "음성을 글자로 바꾸지 못했습니다. 잠시 후 다시 시도해 주세요."))
 
