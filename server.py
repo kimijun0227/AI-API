@@ -334,7 +334,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     async def generate_edge_speech(text: str) -> bytes:
-        communicate = edge_tts.Communicate(text, TTS_VOICE)
+        communicate = edge_tts.Communicate(text, TTS_VOICE, rate="-15%")
         chunks = []
         async for chunk in communicate.stream():
             if chunk.get("type") == "audio":
