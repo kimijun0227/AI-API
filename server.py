@@ -169,6 +169,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/speak":
             self.do_speak()
             return
+        if self.path == "/transcribe":
+            self.do_transcribe()
+            return
         if self.path != "/ask":
             self.send_json(404, {"error": "not_found", "message": "요청한 주소를 찾을 수 없습니다."})
             return
@@ -331,6 +334,49 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             print(f"Edge TTS request failed: {type(exc).__name__}", flush=True)
             self.send_json(502, error_payload("tts_provider_error", "음성을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요."))
+
+    def do_transcribe(self) -> None:
+        if not GROQ_API_KEY:
+            self.send_json(503, error_payload("server_error", "서버에 Groq API 키가 설정되지 않았습니다."))
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 44 or length > 5 * 1024 * 1024:
+                raise ValueError("invalid audio length")
+            audio = self.rfile.read(length)
+            if len(audio) != length or audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
+                raise ValueError("invalid wav audio")
+        except (ValueError, OverflowError):
+            self.send_json(400, error_payload("invalid_audio", "녹음 파일이 올바르지 않습니다."))
+            return
+
+        boundary = "----UnityVoiceBoundary7MA4YWxkTrZu0gW"
+        body = b"".join([
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n".encode("ascii"),
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\nko\r\n".encode("ascii"),
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n".encode("ascii"),
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"voice.wav\"\r\nContent-Type: audio/wav\r\n\r\n".encode("ascii"),
+            audio,
+            f"\r\n--{boundary}--\r\n".encode("ascii"),
+        ])
+        req = Request("https://api.groq.com/openai/v1/audio/transcriptions", data=body, headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "UnityAI-Groq-Server/1.0",
+        }, method="POST")
+        try:
+            with urlopen(req, timeout=60) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            transcript = result.get("text", "") if isinstance(result, dict) else ""
+            if not isinstance(transcript, str) or not transcript.strip():
+                self.send_json(422, error_payload("empty_transcription", "말한 내용을 알아듣지 못했어요. 다시 말해 주세요."))
+                return
+            self.send_json(200, {"text": transcript.strip()})
+        except HTTPError as exc:
+            print(f"Groq transcription HTTP {exc.code}", flush=True)
+            self.send_json(502, error_payload("transcription_error", f"음성 인식 서비스 오류 (Groq HTTP {exc.code})"))
+        except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError):
+            self.send_json(502, error_payload("transcription_error", "음성을 글자로 바꾸지 못했습니다. 잠시 후 다시 시도해 주세요."))
 
     @staticmethod
     async def generate_edge_speech(text: str) -> bytes:
