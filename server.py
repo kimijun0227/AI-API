@@ -33,6 +33,9 @@ MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 TTS_VOICE = "ko-KR-InJoonNeural"
+# These characters should be ignored by speech synthesis. Replace them with
+# spaces so adjacent words do not accidentally run together.
+TTS_IGNORED_CHARS = str.maketrans({char: " " for char in ".,!?/@*^$~`<>"})
 DB_LOCK = threading.Lock()
 INSTALL_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
@@ -288,7 +291,11 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(text, str) or not text.strip():
             self.send_json(400, error_payload("invalid_request", "읽을 문장이 비어 있습니다."))
             return
-        text = text.strip()
+        text = text.translate(TTS_IGNORED_CHARS)
+        text = " ".join(text.split())
+        if not text:
+            self.send_json(400, error_payload("invalid_request", "읽을 문장에 음성으로 읽을 내용이 없습니다."))
+            return
         if len(text) > MAX_TTS_CHARS:
             self.send_json(400, error_payload("too_long", f"음성으로 읽을 문장은 {MAX_TTS_CHARS}자까지만 가능합니다."))
             return
