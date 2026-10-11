@@ -24,7 +24,7 @@ USER_DAILY_LIMIT = int(os.getenv("USER_DAILY_LIMIT", "10"))
 GLOBAL_DAILY_LIMIT = int(os.getenv("GLOBAL_DAILY_LIMIT", "1000"))
 GLOBAL_RPM_LIMIT = int(os.getenv("GLOBAL_RPM_LIMIT", "20"))
 MAX_QUESTION_CHARS = int(os.getenv("MAX_QUESTION_CHARS", "30"))
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "280"))
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "800"))
 TTS_DAILY_LIMIT = int(os.getenv("TTS_DAILY_LIMIT", "10"))
 TTS_GLOBAL_DAILY_LIMIT = int(os.getenv("TTS_GLOBAL_DAILY_LIMIT", "1000"))
 TTS_GLOBAL_RPM_LIMIT = int(os.getenv("TTS_GLOBAL_RPM_LIMIT", "20"))
@@ -339,7 +339,10 @@ class Handler(BaseHTTPRequestHandler):
                     detail += f" (request_id={request_id})"
                 print(f"Groq HTTP {exc.code}{detail}", flush=True)
                 self.send_json(502, error_payload("server_error", f"Groq HTTP {exc.code}{detail}", remaining))
-        except (URLError, TimeoutError, KeyError, IndexError, ValueError, json.JSONDecodeError):
+        except (URLError, TimeoutError, KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
+            # Keep the Unity response generic, while giving Render logs a safe
+            # failure category to distinguish provider, schema, and empty-output issues.
+            print(f"Groq completion handling failed: {type(exc).__name__}", flush=True)
             self.send_json(502, error_payload("server_error", "AI 답변을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.", remaining))
 
     def do_speak(self) -> None:
