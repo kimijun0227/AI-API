@@ -24,7 +24,7 @@ USER_DAILY_LIMIT = int(os.getenv("USER_DAILY_LIMIT", "10"))
 GLOBAL_DAILY_LIMIT = int(os.getenv("GLOBAL_DAILY_LIMIT", "1000"))
 GLOBAL_RPM_LIMIT = int(os.getenv("GLOBAL_RPM_LIMIT", "20"))
 MAX_QUESTION_CHARS = int(os.getenv("MAX_QUESTION_CHARS", "30"))
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "160"))
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "280"))
 TTS_DAILY_LIMIT = int(os.getenv("TTS_DAILY_LIMIT", "10"))
 TTS_GLOBAL_DAILY_LIMIT = int(os.getenv("TTS_GLOBAL_DAILY_LIMIT", "1000"))
 TTS_GLOBAL_RPM_LIMIT = int(os.getenv("TTS_GLOBAL_RPM_LIMIT", "20"))
@@ -38,6 +38,48 @@ TTS_VOICE = "ko-KR-InJoonNeural"
 TTS_IGNORED_CHARS = str.maketrans({char: " " for char in ".,!?/@*^$~`<>"})
 DB_LOCK = threading.Lock()
 INSTALL_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+VOICE_SYSTEM_PROMPT = """
+당신은 친절하고 존중하는 한국어 AI 도우미이며 이름은 보이스입니다.
+정체를 물으면 '저는 당신의 개인 언어 모델 보이스입니다.'라고 답하세요.
+OpenAI가 만들었다고 말하거나 자신을 OpenAI의 언어 모델이라고 소개하지 마세요.
+불확실한 내용은 확실하지 않다고 말하고, 사용자를 욕하거나 비하하지 말며 간결하게 답하세요.
+
+반드시 아래 JSON 객체 하나만 응답하세요. 코드 펜스나 JSON 바깥 설명은 쓰지 마세요.
+{
+  "answer": "사용자에게 할 원래 답변",
+  "tts": "음성으로 읽을 전처리 문장",
+  "visuals": ["화면에 순서대로 보여줄 짧은 단계"]
+}
+
+TTS 전처리 규칙:
+원래 답변의 의미와 문장 순서를 바꾸지 말고, 답변에 없는 내용을 더하지 마세요.
+굵게, 기울임, 제목 표시, 불릿, 번호 등 마크다운 표시는 제거하고 내용은 유지하세요.
+코드는 꼭 읽어야 하는 경우가 아니면 사람이 이해할 자연스러운 말로 바꾸세요.
+별표, 해시, 백틱, 대괄호, 중괄호 같은 화면 표시 기호와 이모지, 장식 문자는 읽지 않게 제거하세요.
+링크는 URL 전체 대신 링크 이름이나 자연스러운 설명만 남기세요.
+수식이나 프로그래밍 기호가 뜻을 가지면 삭제하지 말고 말로 이해되게 표현하세요.
+자연스러운 띄어쓰기와 문장부호만 남기세요. tts 필드에는 순수한 음성용 문장만 넣으세요.
+
+시각 설명 규칙:
+답변 내용을 그림, 비교, 순서, 관계로 보여주면 이해가 쉬울 때만 visuals에 2~4개의 짧은 단계로 적으세요.
+단계는 답변에서 설명한 정보만 간결하게 뽑고, 새 사실을 추가하지 마세요.
+단계별 문구는 화면에 카드로 차례로 나타나고 화살표로 이어집니다.
+시각 설명이 필요하지 않으면 visuals는 빈 배열 []로 두세요.
+""".strip()
+
+
+def preprocess_tts_text(text: str) -> str:
+    """Strip common display-only markup from the model's TTS field."""
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"https?://\S+|www\.\S+", "", text)
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
+    text = re.sub(r"(?m)^\s*[-+*•]\s+", "", text)
+    text = re.sub(r"(?m)^\s*\d+[.)]\s+", "", text)
+    text = re.sub(r"[*_`#\[\]{}]", "", text)
+    text = re.sub(r"[\U0001F000-\U0001FAFF\U00002600-\U000027BF]", "", text)
+    return " ".join(text.split())
 
 
 def day_key() -> str:
@@ -220,7 +262,7 @@ class Handler(BaseHTTPRequestHandler):
         payload = {
             "model": MODEL,
             "messages": [
-                {"role": "system", "content": "당신은 친절하고 존중하는 한국어 AI 도우미이며, 이름은 보이스입니다. 정체를 물으면 '저는 당신의 개인 언어 모델 보이스입니다.'라고 답하세요. OpenAI가 만들었다고 말하거나 자신을 OpenAI의 언어 모델이라고 소개하지 마세요. 모르는 내용이나 불확실한 내용은 확실하지 않다고 말하고 사실처럼 꾸며내지 마세요. 사용자를 욕하거나 비하하지 마세요. 간결하게 답하세요."},
+                {"role": "system", "content": VOICE_SYSTEM_PROMPT},
                 {"role": "user", "content": question},
             ],
             "max_completion_tokens": MAX_OUTPUT_TOKENS,
@@ -236,10 +278,34 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with urlopen(req, timeout=30) as response:
                 result = json.loads(response.read().decode("utf-8"))
-            answer = result["choices"][0]["message"]["content"]
-            if not isinstance(answer, str) or not answer.strip():
+            completion = result["choices"][0]["message"]["content"]
+            if not isinstance(completion, str) or not completion.strip():
                 raise ValueError("empty completion")
-            self.send_json(200, {"answer": answer.strip(), "remaining": remaining, "limit": USER_DAILY_LIMIT})
+            structured = completion.strip()
+            if structured.startswith("```"):
+                structured = re.sub(r"^```(?:json)?\s*|\s*```$", "", structured, flags=re.IGNORECASE)
+            try:
+                parsed = json.loads(structured)
+            except json.JSONDecodeError:
+                parsed = {"answer": completion.strip()}
+            answer = parsed.get("answer", completion.strip()) if isinstance(parsed, dict) else completion.strip()
+            tts_text = parsed.get("tts", answer) if isinstance(parsed, dict) else answer
+            visual_steps = parsed.get("visuals", []) if isinstance(parsed, dict) else []
+            if not isinstance(answer, str) or not answer.strip():
+                answer = completion.strip()
+            if not isinstance(tts_text, str) or not tts_text.strip():
+                tts_text = answer
+            if not isinstance(visual_steps, list):
+                visual_steps = []
+            visuals = [preprocess_tts_text(step)[:100] for step in visual_steps if isinstance(step, str)]
+            visuals = [step for step in visuals if step][:4]
+            self.send_json(200, {
+                "answer": answer.strip(),
+                "tts": preprocess_tts_text(tts_text),
+                "visuals": visuals,
+                "remaining": remaining,
+                "limit": USER_DAILY_LIMIT,
+            })
         except HTTPError as exc:
             if exc.code == 429:
                 self.send_json(429, error_payload("rate_limit", "Groq 요청 한도에 도달했습니다. 잠시 후 다시 시도해 주세요.", remaining))
