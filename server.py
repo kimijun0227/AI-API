@@ -35,12 +35,16 @@ CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "").strip()
 CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "llama3.1-8b")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+CLOUDFLARE_MODEL = os.getenv("CLOUDFLARE_MODEL", "@cf/meta/llama-3.1-8b-instruct")
 PROVIDER_TIMEOUT_SECONDS = float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "7"))
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
 MAX_HISTORY_CHARS = int(os.getenv("MAX_HISTORY_CHARS", "1000"))
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+CLOUDFLARE_CHAT_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
 TTS_VOICE = "ko-KR-InJoonNeural"
 # These characters should be ignored by speech synthesis. Replace them with
 # spaces so adjacent words do not accidentally run together.
@@ -281,6 +285,20 @@ def call_gemini(messages: list[dict]) -> str:
     return content.strip()
 
 
+def call_cloudflare(messages: list[dict]) -> str:
+    """Call Cloudflare Workers AI's OpenAI-compatible chat completions endpoint."""
+    if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
+        raise ProviderFailure("Cloudflare token or account ID is not configured")
+    url = CLOUDFLARE_CHAT_URL.format(account_id=CLOUDFLARE_ACCOUNT_ID)
+    return call_openai_compatible(
+        "Cloudflare Workers AI",
+        url,
+        CLOUDFLARE_API_TOKEN,
+        CLOUDFLARE_MODEL,
+        messages,
+    )
+
+
 def parse_assistant_json(content: str) -> dict:
     structured = content.strip()
     if structured.startswith("```"):
@@ -324,10 +342,11 @@ def build_chat_messages(body: dict, question: str) -> list[dict]:
 
 
 def ask_providers(messages: list[dict]) -> dict:
-    """Use Groq, then Cerebras, then Gemini; normalize every usable response."""
+    """Use Groq, Cerebras, Cloudflare Workers AI, then Gemini."""
     providers = [
         ("Groq", GROQ_API_KEY, lambda: call_openai_compatible("Groq", GROQ_URL, GROQ_API_KEY, MODEL, messages)),
         ("Cerebras", CEREBRAS_API_KEY, lambda: call_openai_compatible("Cerebras", CEREBRAS_URL, CEREBRAS_API_KEY, CEREBRAS_MODEL, messages)),
+        ("Cloudflare Workers AI", bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID), lambda: call_cloudflare(messages)),
         ("Gemini", GEMINI_API_KEY, lambda: call_gemini(messages)),
     ]
     for name, key, request in providers:
@@ -371,6 +390,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ai_providers": {
                     "groq": bool(GROQ_API_KEY),
                     "cerebras": bool(CEREBRAS_API_KEY),
+                    "cloudflare_workers_ai": bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID),
                     "gemini": bool(GEMINI_API_KEY),
                 },
             })
