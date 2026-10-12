@@ -1,1 +1,1 @@
-edge-tts==7.2.8
+# No third-party packages are required; Azure Speech is called over REST.
