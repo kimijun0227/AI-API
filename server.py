@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("AI_DB_PATH", str(ROOT / "ai_usage.sqlite3")))
 TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Asia/Seoul"))
 USER_DAILY_LIMIT = int(os.getenv("USER_DAILY_LIMIT", "10"))
-GLOBAL_DAILY_LIMIT = int(os.getenv("GLOBAL_DAILY_LIMIT", "1000"))
+GLOBAL_DAILY_LIMIT = int(os.getenv("GLOBAL_DAILY_LIMIT", "0"))
 GLOBAL_RPM_LIMIT = int(os.getenv("GLOBAL_RPM_LIMIT", "20"))
 MAX_QUESTION_CHARS = int(os.getenv("MAX_QUESTION_CHARS", "30"))
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "800"))
@@ -31,7 +31,16 @@ TTS_GLOBAL_RPM_LIMIT = int(os.getenv("TTS_GLOBAL_RPM_LIMIT", "20"))
 MAX_TTS_CHARS = int(os.getenv("MAX_TTS_CHARS", "2000"))
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "").strip()
+CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "llama3.1-8b")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+PROVIDER_TIMEOUT_SECONDS = float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "7"))
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
+MAX_HISTORY_CHARS = int(os.getenv("MAX_HISTORY_CHARS", "1000"))
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 TTS_VOICE = "ko-KR-InJoonNeural"
 # These characters should be ignored by speech synthesis. Replace them with
 # spaces so adjacent words do not accidentally run together.
@@ -138,7 +147,7 @@ def reserve_request(user_id: str) -> tuple[str | None, int]:
         global_used = conn.execute("SELECT used FROM global_daily WHERE day=?", (today,)).fetchone()[0]
         minute_used = conn.execute("SELECT used FROM global_minute WHERE minute=?", (minute,)).fetchone()[0]
 
-        if global_used >= GLOBAL_DAILY_LIMIT:
+        if GLOBAL_DAILY_LIMIT > 0 and global_used >= GLOBAL_DAILY_LIMIT:
             conn.rollback()
             return "global_limit", max(0, USER_DAILY_LIMIT - user_used)
         if minute_used >= GLOBAL_RPM_LIMIT:
@@ -186,6 +195,157 @@ def error_payload(code: str, message: str, remaining: int = -1, limit: int = USE
     return {"error": code, "message": message, "remaining": remaining, "limit": limit}
 
 
+class ProviderFailure(Exception):
+    """A provider failed or returned an unusable response; try the next provider."""
+
+
+def request_provider_json(url: str, payload: dict, headers: dict, provider: str) -> dict:
+    request = Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+    try:
+        with urlopen(request, timeout=PROVIDER_TIMEOUT_SECONDS) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        if not isinstance(result, dict):
+            raise ValueError("provider returned a non-object response")
+        return result
+    except HTTPError as exc:
+        # Never log provider response bodies: they may contain user content or sensitive data.
+        request_id = exc.headers.get("x-request-id", "") if exc.headers else ""
+        suffix = f" request_id={request_id}" if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id) else ""
+        print(f"{provider} HTTP {exc.code}{suffix}; trying next provider", flush=True)
+        raise ProviderFailure(f"{provider} HTTP {exc.code}") from exc
+    except (URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"{provider} request failed: {type(exc).__name__}; trying next provider", flush=True)
+        raise ProviderFailure(f"{provider} request failed") from exc
+
+
+def call_openai_compatible(provider: str, url: str, api_key: str, model: str, messages: list[dict]) -> str:
+    if not api_key:
+        raise ProviderFailure(f"{provider} API key is not configured")
+    payload = {
+        "model": model,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "temperature": 0.5,
+    }
+    result = request_provider_json(url, payload, {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": "UnityVoice-Backend/1.0",
+    }, provider)
+    try:
+        content = result["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ProviderFailure(f"{provider} returned an invalid completion") from exc
+    if not isinstance(content, str) or not content.strip():
+        raise ProviderFailure(f"{provider} returned an empty completion")
+    return content.strip()
+
+
+def call_gemini(messages: list[dict]) -> str:
+    if not GEMINI_API_KEY:
+        raise ProviderFailure("Gemini API key is not configured")
+    system_text = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+    contents = []
+    for message in messages:
+        if message["role"] == "system":
+            continue
+        role = "model" if message["role"] == "assistant" else "user"
+        # Gemini requires alternating roles; merge adjacent same-role turns safely.
+        if contents and contents[-1]["role"] == role:
+            contents[-1]["parts"][0]["text"] += "\n" + message["content"]
+        else:
+            contents.append({"role": role, "parts": [{"text": message["content"]}]})
+    payload = {
+        "systemInstruction": {"parts": [{"text": system_text}]},
+        "contents": contents,
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "maxOutputTokens": MAX_OUTPUT_TOKENS,
+            "temperature": 0.5,
+        },
+    }
+    url = GEMINI_URL.format(model=GEMINI_MODEL)
+    result = request_provider_json(url, payload, {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+        "User-Agent": "UnityVoice-Backend/1.0",
+    }, "Gemini")
+    try:
+        parts = result["candidates"][0]["content"]["parts"]
+        content = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ProviderFailure("Gemini returned an invalid completion") from exc
+    if not content.strip():
+        raise ProviderFailure("Gemini returned an empty completion")
+    return content.strip()
+
+
+def parse_assistant_json(content: str) -> dict:
+    structured = content.strip()
+    if structured.startswith("```"):
+        structured = re.sub(r"^```(?:json)?\s*|\s*```$", "", structured, flags=re.IGNORECASE)
+    parsed = json.loads(structured)
+    if not isinstance(parsed, dict):
+        raise ValueError("completion is not a JSON object")
+    answer = parsed.get("answer")
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError("completion is missing answer")
+    tts_text = parsed.get("tts", answer)
+    visuals = parsed.get("visuals", [])
+    if not isinstance(tts_text, str):
+        tts_text = answer
+    if not isinstance(visuals, list):
+        visuals = []
+    return {
+        "answer": answer.strip(),
+        "tts": preprocess_tts_text(tts_text),
+        "visuals": [preprocess_tts_text(step)[:100] for step in visuals if isinstance(step, str) and preprocess_tts_text(step)][:4],
+    }
+
+
+def build_chat_messages(body: dict, question: str) -> list[dict]:
+    """Keep a bounded user/assistant history while owning the system prompt server-side."""
+    source = body.get("history", body.get("messages", []))
+    if source is None:
+        source = []
+    if not isinstance(source, list):
+        raise ValueError("history must be an array")
+    history = []
+    for item in source[-MAX_HISTORY_MESSAGES:]:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role not in ("user", "assistant") or not isinstance(content, str) or not content.strip():
+            continue
+        history.append({"role": role, "content": content.strip()[:MAX_HISTORY_CHARS]})
+    return [{"role": "system", "content": VOICE_SYSTEM_PROMPT}, *history, {"role": "user", "content": question}]
+
+
+def ask_providers(messages: list[dict]) -> dict:
+    """Use Groq, then Cerebras, then Gemini; normalize every usable response."""
+    providers = [
+        ("Groq", GROQ_API_KEY, lambda: call_openai_compatible("Groq", GROQ_URL, GROQ_API_KEY, MODEL, messages)),
+        ("Cerebras", CEREBRAS_API_KEY, lambda: call_openai_compatible("Cerebras", CEREBRAS_URL, CEREBRAS_API_KEY, CEREBRAS_MODEL, messages)),
+        ("Gemini", GEMINI_API_KEY, lambda: call_gemini(messages)),
+    ]
+    for name, key, request in providers:
+        if not key:
+            print(f"{name} skipped: API key is not configured", flush=True)
+            continue
+        try:
+            normalized = parse_assistant_json(request())
+            print(f"AI response provider={name}", flush=True)
+            return normalized
+        except Exception as exc:
+            print(f"{name} unusable: {type(exc).__name__}; trying next provider", flush=True)
+
+    # Keep the mobile client alive and return the exact same success schema.
+    emergency = "지금은 AI 답변을 만들 수 없습니다. 잠시 후 다시 시도해 주세요."
+    return {"answer": emergency, "tts": emergency, "visuals": []}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "PersonalAI/1.0"
 
@@ -204,7 +364,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            self.send_json(200, {"ok": True, "tts_configured": True, "tts_provider": "edge-tts"})
+            self.send_json(200, {
+                "ok": True,
+                "tts_configured": True,
+                "tts_provider": "edge-tts",
+                "ai_providers": {
+                    "groq": bool(GROQ_API_KEY),
+                    "cerebras": bool(CEREBRAS_API_KEY),
+                    "gemini": bool(GEMINI_API_KEY),
+                },
+            })
         else:
             self.send_json(404, {"error": "not_found", "message": "요청한 주소를 찾을 수 없습니다."})
 
@@ -218,17 +387,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/ask":
             self.send_json(404, {"error": "not_found", "message": "요청한 주소를 찾을 수 없습니다."})
             return
-        if not GROQ_API_KEY:
-            self.send_json(503, error_payload("server_error", "서버에 Groq API 키가 설정되지 않았습니다."))
-            return
-
         install_id = self.headers.get("X-Install-Id", "").strip()
         if not INSTALL_ID_RE.fullmatch(install_id):
             self.send_json(400, error_payload("invalid_user", "앱 식별 정보가 올바르지 않습니다."))
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length < 1 or length > 16_384:
+            if length < 1 or length > 65_536:
                 raise ValueError("invalid content length")
             body = json.loads(self.rfile.read(length).decode("utf-8"))
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
@@ -246,6 +411,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
+            messages = build_chat_messages(body, question)
+        except (ValueError, TypeError):
+            self.send_json(400, error_payload("invalid_request", "대화 기록 형식을 확인해 주세요."))
+            return
+
+        try:
             denial, remaining = reserve_request(install_id)
         except sqlite3.Error:
             self.send_json(503, error_payload("server_error", "사용량 저장소에 문제가 생겼습니다."))
@@ -260,91 +431,27 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(429, error_payload("user_limit", "오늘 사용할 수 있는 질문을 모두 사용했어요.", 0))
             return
 
-        payload = {
-            "model": MODEL,
-            "messages": [
-                {"role": "system", "content": VOICE_SYSTEM_PROMPT},
-                {"role": "user", "content": question},
-            ],
-            "max_completion_tokens": MAX_OUTPUT_TOKENS,
-            "temperature": 0.5,
-        }
-        req = Request(GROQ_URL, data=json.dumps(payload).encode("utf-8"), headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-            # Groq's Cloudflare edge can reject urllib's default Python-urllib UA
-            # with HTTP 403 / error code 1010. Identify this API client explicitly.
-            "User-Agent": "UnityAI-Groq-Server/1.0",
-        }, method="POST")
         try:
-            with urlopen(req, timeout=30) as response:
-                result = json.loads(response.read().decode("utf-8"))
-            completion = result["choices"][0]["message"]["content"]
-            if not isinstance(completion, str) or not completion.strip():
-                raise ValueError("empty completion")
-            structured = completion.strip()
-            if structured.startswith("```"):
-                structured = re.sub(r"^```(?:json)?\s*|\s*```$", "", structured, flags=re.IGNORECASE)
-            try:
-                parsed = json.loads(structured)
-            except json.JSONDecodeError:
-                parsed = {"answer": completion.strip()}
-            answer = parsed.get("answer", completion.strip()) if isinstance(parsed, dict) else completion.strip()
-            tts_text = parsed.get("tts", answer) if isinstance(parsed, dict) else answer
-            visual_steps = parsed.get("visuals", []) if isinstance(parsed, dict) else []
-            if not isinstance(answer, str) or not answer.strip():
-                answer = completion.strip()
-            if not isinstance(tts_text, str) or not tts_text.strip():
-                tts_text = answer
-            if not isinstance(visual_steps, list):
-                visual_steps = []
-            visuals = [preprocess_tts_text(step)[:100] for step in visual_steps if isinstance(step, str)]
-            visuals = [step for step in visuals if step][:4]
+            normalized = ask_providers(messages)
             self.send_json(200, {
-                "answer": answer.strip(),
-                "tts": preprocess_tts_text(tts_text),
-                "visuals": visuals,
+                "answer": normalized["answer"],
+                "tts": normalized["tts"],
+                "visuals": normalized["visuals"],
                 "remaining": remaining,
                 "limit": USER_DAILY_LIMIT,
             })
-        except HTTPError as exc:
-            if exc.code == 429:
-                self.send_json(429, error_payload("rate_limit", "Groq 요청 한도에 도달했습니다. 잠시 후 다시 시도해 주세요.", remaining))
-            else:
-                # Capture a short, sanitized provider response so permission errors
-                # can be diagnosed without logging the request, headers, or API key.
-                detail = ""
-                raw_body = ""
-                try:
-                    raw_body = exc.read().decode("utf-8", errors="replace")
-                    parsed = json.loads(raw_body)
-                    provider_error = parsed.get("error", parsed) if isinstance(parsed, dict) else parsed
-                    if isinstance(provider_error, dict):
-                        code = str(provider_error.get("code") or provider_error.get("type") or "")
-                        message = str(provider_error.get("message") or provider_error.get("detail") or "")
-                        if code:
-                            detail += f" [{code}]"
-                        if message:
-                            detail += f" {message}"
-                    elif provider_error:
-                        detail = f" {provider_error}"
-                except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError):
-                    detail = f" {raw_body}"
-                if not detail and raw_body:
-                    detail = f" {raw_body}"
-                if GROQ_API_KEY:
-                    detail = detail.replace(GROQ_API_KEY, "[redacted]")
-                detail = " ".join(detail.split())[:360]
-                request_id = exc.headers.get("x-request-id", "") if exc.headers else ""
-                if request_id and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id):
-                    detail += f" (request_id={request_id})"
-                print(f"Groq HTTP {exc.code}{detail}", flush=True)
-                self.send_json(502, error_payload("server_error", f"Groq HTTP {exc.code}{detail}", remaining))
-        except (URLError, TimeoutError, KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
-            # Keep the Unity response generic, while giving Render logs a safe
-            # failure category to distinguish provider, schema, and empty-output issues.
-            print(f"Groq completion handling failed: {type(exc).__name__}", flush=True)
-            self.send_json(502, error_payload("server_error", "AI 답변을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.", remaining))
+        except Exception as exc:
+            # The server process must survive unexpected parsing/provider failures.
+            # Keep the response schema stable even in this last-resort path.
+            print(f"AI fallback handler failed: {type(exc).__name__}", flush=True)
+            emergency = "지금은 AI 답변을 만들 수 없습니다. 잠시 후 다시 시도해 주세요."
+            self.send_json(200, {
+                "answer": emergency,
+                "tts": emergency,
+                "visuals": [],
+                "remaining": remaining,
+                "limit": USER_DAILY_LIMIT,
+            })
 
     def do_speak(self) -> None:
         install_id = self.headers.get("X-Install-Id", "").strip()
