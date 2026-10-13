@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-import asyncio
+import base64
 import os
 import re
 import sqlite3
@@ -37,6 +37,8 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 CLOUDFLARE_MODEL = os.getenv("CLOUDFLARE_MODEL", "@cf/meta/llama-3.1-8b-instruct")
+CLOUDFLARE_TTS_MODEL = os.getenv("CLOUDFLARE_TTS_MODEL", "@cf/myshell-ai/melotts").strip()
+CLOUDFLARE_TTS_LANG = os.getenv("CLOUDFLARE_TTS_LANG", "KR").strip()
 PROVIDER_TIMEOUT_SECONDS = float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "7"))
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
 MAX_HISTORY_CHARS = int(os.getenv("MAX_HISTORY_CHARS", "1000"))
@@ -44,7 +46,6 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 CLOUDFLARE_CHAT_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
-TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "ko-KR-InJoonNeural").strip()
 # These characters should be ignored by speech synthesis. Replace them with
 # spaces so adjacent words do not accidentally run together.
 TTS_IGNORED_CHARS = str.maketrans({char: " " for char in ".,!?/@*^$~`<>"})
@@ -168,7 +169,7 @@ def reserve_request(user_id: str) -> tuple[str | None, int]:
 
 
 def reserve_tts(user_id: str) -> str | None:
-    """Bound Azure speech usage per install, globally per day, and per minute."""
+    """Bound speech usage per install, globally per day, and per minute."""
     today, minute = day_key(), minute_key()
     with DB_LOCK, connect_db() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -384,8 +385,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self.send_json(200, {
                 "ok": True,
-                "tts_configured": True,
-                "tts_provider": "edge-tts",
+                "tts_configured": bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID),
+                "tts_provider": "cloudflare-workers-ai-melotts",
                 "ai_providers": {
                     "groq": bool(GROQ_API_KEY),
                     "cerebras": bool(CEREBRAS_API_KEY),
@@ -515,7 +516,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            audio = self.generate_edge_speech(text)
+            audio = self.generate_cloudflare_speech(text)
             if not audio:
                 raise ValueError("empty speech response")
             self.send_response(200)
@@ -525,13 +526,13 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(audio)
         except HTTPError as exc:
-            print(f"Edge TTS HTTP error {exc.code}", flush=True)
+            request_id = exc.headers.get("cf-ray", "") if exc.headers else ""
+            suffix = f" cf-ray={request_id}" if re.fullmatch(r"[A-Za-z0-9-]{1,128}", request_id) else ""
+            print(f"Cloudflare MeloTTS HTTP error {exc.code}{suffix}", flush=True)
             self.send_json(502, error_payload("tts_provider_error", "음성 서비스 요청이 실패했습니다. 잠시 후 다시 시도해 주세요."))
         except Exception as exc:
-            # Keep user text out of logs; the exception class helps diagnose handshake failures.
-            status = getattr(exc, "status", None)
-            status_note = f" status={status}" if isinstance(status, int) else ""
-            print(f"Edge TTS request failed: {type(exc).__name__}{status_note}", flush=True)
+            # Keep user text and credentials out of logs.
+            print(f"Cloudflare MeloTTS request failed: {type(exc).__name__}", flush=True)
             self.send_json(502, error_payload("tts_provider_error", "음성을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요."))
 
     def do_transcribe(self) -> None:
@@ -599,34 +600,40 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(502, error_payload("transcription_error", "음성을 글자로 바꾸지 못했습니다. 잠시 후 다시 시도해 주세요."))
 
     @staticmethod
-    def generate_edge_speech(text: str) -> bytes:
-        """Synthesize Korean InJoon speech with Edge TTS, retrying transient handshakes."""
-        import edge_tts
+    def generate_cloudflare_speech(text: str) -> bytes:
+        """Synthesize Korean MP3 with Cloudflare Workers AI MeloTTS."""
+        if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
+            raise RuntimeError("Cloudflare Workers AI token or account ID is not configured")
+        if not re.fullmatch(r"[A-Za-z0-9-]{8,64}", CLOUDFLARE_ACCOUNT_ID):
+            raise RuntimeError("Cloudflare account ID is invalid")
+        if not CLOUDFLARE_TTS_MODEL.startswith("@cf/"):
+            raise RuntimeError("Cloudflare TTS model is invalid")
 
-        async def synthesize() -> bytes:
-            last_error: Exception | None = None
-            for attempt in range(3):
-                try:
-                    communicate = edge_tts.Communicate(
-                        text,
-                        voice=TTS_VOICE,
-                        rate="-10%",
-                    )
-                    chunks = bytearray()
-                    async for chunk in communicate.stream():
-                        if chunk.get("type") == "audio":
-                            chunks.extend(chunk.get("data", b""))
-                    if chunks:
-                        return bytes(chunks)
-                    raise RuntimeError("Edge TTS returned empty audio")
-                except Exception as exc:
-                    last_error = exc
-                    if attempt < 2:
-                        await asyncio.sleep(0.5 * (attempt + 1))
-            assert last_error is not None
-            raise last_error
+        endpoint = (
+            "https://api.cloudflare.com/client/v4/accounts/"
+            f"{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CLOUDFLARE_TTS_MODEL}"
+        )
+        payload = json.dumps({"prompt": text, "lang": CLOUDFLARE_TTS_LANG}).encode("utf-8")
+        request = Request(endpoint, data=payload, headers={
+            "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg, application/json",
+            "User-Agent": "UnityVoice-Backend/1.0",
+        }, method="POST")
+        with urlopen(request, timeout=45) as response:
+            data = response.read()
+            content_type = response.headers.get("Content-Type", "").lower()
 
-        return asyncio.run(synthesize())
+        if "json" in content_type or data.lstrip().startswith(b"{"):
+            result = json.loads(data.decode("utf-8"))
+            inner = result.get("result", result) if isinstance(result, dict) else {}
+            audio_base64 = inner.get("audio") if isinstance(inner, dict) else None
+            if not isinstance(audio_base64, str) or not audio_base64:
+                raise ValueError("Cloudflare MeloTTS response did not contain audio")
+            data = base64.b64decode(audio_base64, validate=True)
+        if not data:
+            raise ValueError("Cloudflare MeloTTS returned empty audio")
+        return data
 
 
 if __name__ == "__main__":
