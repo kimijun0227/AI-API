@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import os
 import re
 import sqlite3
@@ -43,10 +44,7 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 CLOUDFLARE_CHAT_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
-AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "").strip()
-AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "").strip()
-TTS_VOICE = os.getenv("AZURE_SPEECH_VOICE", "ko-KR-InJoonNeural").strip()
-AZURE_TTS_FORMAT = os.getenv("AZURE_TTS_FORMAT", "audio-24khz-48kbitrate-mono-mp3").strip()
+TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "ko-KR-InJoonNeural").strip()
 # These characters should be ignored by speech synthesis. Replace them with
 # spaces so adjacent words do not accidentally run together.
 TTS_IGNORED_CHARS = str.maketrans({char: " " for char in ".,!?/@*^$~`<>"})
@@ -386,8 +384,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self.send_json(200, {
                 "ok": True,
-                "tts_configured": bool(AZURE_SPEECH_KEY and AZURE_SPEECH_REGION),
-                "tts_provider": "azure-speech",
+                "tts_configured": True,
+                "tts_provider": "edge-tts",
                 "ai_providers": {
                     "groq": bool(GROQ_API_KEY),
                     "cerebras": bool(CEREBRAS_API_KEY),
@@ -517,7 +515,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            audio = self.generate_azure_speech(text)
+            audio = self.generate_edge_speech(text)
             if not audio:
                 raise ValueError("empty speech response")
             self.send_response(200)
@@ -527,11 +525,13 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(audio)
         except HTTPError as exc:
-            # Azure error bodies can include request details; log only the status.
-            print(f"Azure Speech TTS HTTP error {exc.code}", flush=True)
+            print(f"Edge TTS HTTP error {exc.code}", flush=True)
             self.send_json(502, error_payload("tts_provider_error", "음성 서비스 요청이 실패했습니다. 잠시 후 다시 시도해 주세요."))
         except Exception as exc:
-            print(f"Azure Speech TTS request failed: {type(exc).__name__}", flush=True)
+            # Keep user text out of logs; the exception class helps diagnose handshake failures.
+            status = getattr(exc, "status", None)
+            status_note = f" status={status}" if isinstance(status, int) else ""
+            print(f"Edge TTS request failed: {type(exc).__name__}{status_note}", flush=True)
             self.send_json(502, error_payload("tts_provider_error", "음성을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요."))
 
     def do_transcribe(self) -> None:
@@ -599,33 +599,34 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(502, error_payload("transcription_error", "음성을 글자로 바꾸지 못했습니다. 잠시 후 다시 시도해 주세요."))
 
     @staticmethod
-    def generate_azure_speech(text: str) -> bytes:
-        """Synthesize Korean speech through Azure's authenticated REST endpoint."""
-        if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
-            raise RuntimeError("Azure Speech key or region is not configured")
-        if not re.fullmatch(r"[A-Za-z0-9-]{2,32}", AZURE_SPEECH_REGION):
-            raise RuntimeError("Azure Speech region is invalid")
-        # XML-escape user/model text before embedding it in SSML.
-        from xml.sax.saxutils import escape
-        ssml = (
-            '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
-            'xml:lang="ko-KR">'
-            f'<voice name="{TTS_VOICE}"><prosody rate="-10%">{escape(text)}</prosody></voice>'
-            '</speak>'
-        )
-        endpoint = f"https://{AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
-        request = Request(endpoint, data=ssml.encode("utf-8"), headers={
-            "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
-            "Content-Type": "application/ssml+xml",
-            "X-Microsoft-OutputFormat": AZURE_TTS_FORMAT,
-            "User-Agent": "UnityVoice-Backend/1.0",
-        }, method="POST")
-        with urlopen(request, timeout=30) as response:
-            audio = response.read()
-            content_type = response.headers.get("Content-Type", "")
-        if not audio or (content_type and "audio" not in content_type.lower()):
-            raise ValueError("Azure Speech returned an invalid audio response")
-        return audio
+    def generate_edge_speech(text: str) -> bytes:
+        """Synthesize Korean InJoon speech with Edge TTS, retrying transient handshakes."""
+        import edge_tts
+
+        async def synthesize() -> bytes:
+            last_error: Exception | None = None
+            for attempt in range(3):
+                try:
+                    communicate = edge_tts.Communicate(
+                        text,
+                        voice=TTS_VOICE,
+                        rate="-10%",
+                    )
+                    chunks = bytearray()
+                    async for chunk in communicate.stream():
+                        if chunk.get("type") == "audio":
+                            chunks.extend(chunk.get("data", b""))
+                    if chunks:
+                        return bytes(chunks)
+                    raise RuntimeError("Edge TTS returned empty audio")
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+            assert last_error is not None
+            raise last_error
+
+        return asyncio.run(synthesize())
 
 
 if __name__ == "__main__":
