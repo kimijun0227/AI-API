@@ -1,38 +1,34 @@
-# Unity 앱용 Groq 서버
+# Unity 보이스 AI 서버
 
-Unity `AIClient`가 사용하는 `POST /ask` 형식과 호환되는 작은 Python 서버입니다. Groq API 키는 환경변수 `GROQ_API_KEY`에서만 읽습니다.
+Unity 앱에서 음성 인식, AI 응답, 음성 합성을 호출하는 Python 서버입니다. AI 응답은 Groq, Cerebras, Gemini, Cloudflare Workers AI 순으로 대체할 수 있으며, 음성 합성은 Cloudflare Workers AI의 MeloTTS를 사용합니다.
 
-## 실행
+## Render 설정
 
-Python 3.10 이상이 필요합니다. 이 서버는 Python 표준 라이브러리만 사용합니다.
+Render 서비스의 Environment에 다음 환경변수를 설정하세요. 키와 계정 ID는 저장소나 Unity 앱에 넣지 말고 Render의 비밀 환경변수로만 관리합니다.
 
-1. 호스팅 서비스의 비밀 환경변수에 `.env.example`의 값을 등록합니다. `GROQ_API_KEY`는 실제 키로 설정합니다.
-2. `python server.py`로 실행합니다.
-3. Unity의 `AIClient.serverUrl`에 배포된 HTTPS 서버 주소를 넣고 `askPath`는 `/ask`로 둡니다.
+필수 설정:
 
-개발 PC에서만 확인할 때는 `HOST=127.0.0.1`로 실행하고 `/health`를 확인할 수 있습니다. Android 기기의 `localhost`는 개발 PC가 아니라 Android 기기 자신을 가리킵니다.
+- `GROQ_API_KEY`: AI 응답과 음성 인식에 사용합니다.
+- `CLOUDFLARE_API_TOKEN`: Workers AI 호출 권한이 있는 Cloudflare API 토큰입니다. Workers AI Read/Edit 권한을 부여하세요.
+- `CLOUDFLARE_ACCOUNT_ID`: Cloudflare 대시보드의 계정 ID입니다.
 
-## 제한과 저장
+Cloudflare 변수 이름이 이미 Render에 있다면 값은 바꾸지 않아도 됩니다. TTS 기본 모델과 한국어 설정은 각각 `CLOUDFLARE_TTS_MODEL=@cf/myshell-ai/melotts`, `CLOUDFLARE_TTS_LANG=KR`입니다. 모델을 바꿀 때만 별도로 설정하세요.
 
-- 사용자별 일일 질문 10회, 질문 30자, 전체 분당 요청 수, 전체 일일 요청 수를 서버에서 검사합니다.
-- 일일 날짜 경계는 `APP_TIMEZONE` 기준 자정이며 기본값은 한국 시간입니다.
-- 요청을 Groq로 보내기 전에 횟수를 예약합니다. Groq 호출 실패도 서버의 예약량에 포함되어 반복 재시도로 한도를 우회하지 못합니다.
-- 사용량은 SQLite에 저장됩니다. 호스팅 환경에서 재시작 후에도 유지되도록 영구 디스크를 연결하고 `AI_DB_PATH`를 그 경로로 지정해야 합니다.
-- `X-Install-Id`는 현재 Unity 클라이언트가 보내는 임의 설치 ID입니다. 앱 재설치·기기 변경·ID 위조로 사용자 제한을 우회할 수 있으므로 실제 출시에서 강한 사용자별 제한을 원하면 Firebase Authentication 등 검증된 로그인 토큰을 서버에서 검증하도록 추가해야 합니다.
-- 이 단일 프로세스 서버는 한 인스턴스의 SQLite 저장소를 기준으로 전체 한도를 계산합니다. 여러 서버 인스턴스를 운영하면 Redis나 관리형 데이터베이스로 한도 카운터를 공유해야 합니다.
+변수를 저장한 뒤 Render에서 재배포하고, `GET /health` 응답의 `tts_configured`가 `true`인지 확인하세요. `false`이면 토큰 또는 계정 ID가 비어 있거나 변수 이름이 다릅니다. 실제 음성 요청은 `POST /speak`로 처리하며 MP3를 반환합니다.
 
-Groq의 모델별 RPM/RPD/TPM 한도는 계정·모델·요금제에 따라 달라질 수 있으므로 `GLOBAL_DAILY_LIMIT`, `GLOBAL_RPM_LIMIT`, `GROQ_MODEL`을 실제 Groq 콘솔의 값에 맞춰 설정하세요. 앱 내부 카운터는 Groq 계정의 공식 제한을 대신하지 않습니다.
+## Unity 연결
+
+Unity `AIClient.serverUrl`에 Render의 HTTPS 주소를 입력합니다. 기존 `/ask`, `/transcribe`, `/speak` 경로와 MP3 응답 형식을 유지하므로 TTS 공급자 변경 때문에 Unity 스크립트는 수정하지 않아도 됩니다.
 
 ## API
 
-요청:
+- `POST /ask`: JSON AI 응답 및 시각 설명 데이터를 반환합니다.
+- `POST /transcribe`: WAV 녹음을 한국어 텍스트로 변환합니다.
+- `POST /speak`: 텍스트를 한국어 MP3 음성으로 합성합니다.
+- `GET /health`: 서버와 공급자 설정 여부를 반환합니다.
 
-```http
-POST /ask
-Content-Type: application/json
-X-Install-Id: Unity가 생성한 설치 ID
+요청·응답 세부 형식은 [API_SPEC.md](API_SPEC.md)를 참고하세요.
 
-{"question":"안녕하세요"}
-```
+## 제한과 저장
 
-성공 응답은 `{"answer":"...","remaining":9,"limit":10}`입니다. 오류의 `error` 코드는 Unity `AIClient`가 해석하는 `user_limit`, `global_limit`, `rate_limit`, `too_long`과 호환됩니다. 상태 확인은 `GET /health`를 사용합니다.
+사용자별·전체 일일 호출 제한과 분당 호출 제한은 환경변수로 설정합니다. 사용량은 SQLite에 저장되므로 Render에서 재시작 후에도 보존하려면 영구 디스크를 연결하고 `AI_DB_PATH`를 그 경로로 설정해야 합니다. 현재 제한은 서버의 자체 카운터이며 각 공급자의 계정 한도를 대신하지 않습니다.
