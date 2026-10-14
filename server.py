@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import json
 import base64
+import io
 import os
 import re
 import sqlite3
 import threading
 import time
+import wave
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -48,7 +50,7 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:ge
 CLOUDFLARE_CHAT_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
 # These characters should be ignored by speech synthesis. Replace them with
 # spaces so adjacent words do not accidentally run together.
-TTS_IGNORED_CHARS = str.maketrans({char: " " for char in ".,!?/@*^$~`<>"})
+TTS_IGNORED_CHARS = str.maketrans({char: " " for char in ",!?/@*^$~`<>"})
 DB_LOCK = threading.Lock()
 INSTALL_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
@@ -491,9 +493,10 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(text, str) or not text.strip():
             self.send_json(400, error_payload("invalid_request", "읽을 문장이 비어 있습니다."))
             return
+        # Keep periods as sentence boundaries; other display punctuation is still omitted.
         text = text.translate(TTS_IGNORED_CHARS)
         text = " ".join(text.split())
-        if not text:
+        if not text.strip(" ."):
             self.send_json(400, error_payload("invalid_request", "읽을 문장에 음성으로 읽을 내용이 없습니다."))
             return
         if len(text) > MAX_TTS_CHARS:
@@ -516,7 +519,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            audio, audio_content_type = self.generate_cloudflare_speech(text)
+            audio, audio_content_type = self.generate_cloudflare_speech_with_pauses(text)
             if not audio:
                 raise ValueError("empty speech response")
             self.send_response(200)
@@ -598,6 +601,50 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(502, error_payload("transcription_error", message))
         except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError):
             self.send_json(502, error_payload("transcription_error", "음성을 글자로 바꾸지 못했습니다. 잠시 후 다시 시도해 주세요."))
+
+    @staticmethod
+    def generate_cloudflare_speech_with_pauses(text: str) -> tuple[bytes, str]:
+        """Synthesize each period-delimited sentence and insert 0.8 seconds of silence."""
+        # Split after a period and its following whitespace, so decimal points such as 3.14 stay intact.
+        sentences = [part.strip() for part in re.split(r"(?<=\.)\s+", text.strip()) if part.strip(" .")]
+        if not sentences:
+            raise ValueError("speech text contains no readable sentence")
+        if len(sentences) == 1:
+            return Handler.generate_cloudflare_speech(sentences[0])
+
+        clips = [Handler.generate_cloudflare_speech(sentence) for sentence in sentences]
+        if any(content_type != "audio/wav" for _, content_type in clips):
+            raise ValueError("sentence pauses require WAV audio from the TTS provider")
+
+        audio_parts: list[bytes] = []
+        reference_params = None
+        sample_width = channels = sample_rate = 0
+        for audio, _ in clips:
+            with wave.open(io.BytesIO(audio), "rb") as source:
+                params = source.getparams()
+                if params.comptype != "NONE":
+                    raise ValueError("sentence pauses require uncompressed PCM WAV audio")
+                if reference_params is None:
+                    reference_params = params
+                    sample_width = params.sampwidth
+                    channels = params.nchannels
+                    sample_rate = params.framerate
+                elif (params.nchannels, params.sampwidth, params.framerate, params.comptype) != (
+                    channels, sample_width, sample_rate, reference_params.comptype
+                ):
+                    raise ValueError("TTS sentence audio formats do not match")
+                audio_parts.append(source.readframes(params.nframes))
+
+        silence_frame = b"\x80" if sample_width == 1 else b"\x00"
+        silence = silence_frame * int(sample_rate * 0.8) * channels * sample_width
+        output = io.BytesIO()
+        with wave.open(output, "wb") as combined:
+            combined.setparams(reference_params)
+            for index, frames in enumerate(audio_parts):
+                combined.writeframesraw(frames)
+                if index < len(audio_parts) - 1:
+                    combined.writeframesraw(silence)
+        return output.getvalue(), "audio/wav"
 
     @staticmethod
     def generate_cloudflare_speech(text: str) -> tuple[bytes, str]:
