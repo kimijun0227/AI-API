@@ -1,1 +1,2 @@
-# Cloudflare Workers AI 호출은 Python 표준 라이브러리만 사용
+# AdMob rewarded-ad server-side verification (ECDSA signatures).
+cryptography>=42.0.0,<47.0.0
