@@ -13,6 +13,7 @@ import wave
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
@@ -22,6 +23,9 @@ ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("AI_DB_PATH", str(ROOT / "ai_usage.sqlite3")))
 TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Asia/Seoul"))
 USER_DAILY_LIMIT = int(os.getenv("USER_DAILY_LIMIT", "10"))
+ADMOB_REWARDED_AD_UNIT_ID = os.getenv("ADMOB_REWARDED_AD_UNIT_ID", "").strip()
+ADMOB_REWARD_AMOUNT = int(os.getenv("ADMOB_REWARD_AMOUNT", "5"))
+ADMOB_REWARD_ITEM = os.getenv("ADMOB_REWARD_ITEM", "AI 질문").strip()
 GLOBAL_DAILY_LIMIT = int(os.getenv("GLOBAL_DAILY_LIMIT", "0"))
 GLOBAL_RPM_LIMIT = int(os.getenv("GLOBAL_RPM_LIMIT", "20"))
 MAX_QUESTION_CHARS = int(os.getenv("MAX_QUESTION_CHARS", "30"))
@@ -53,6 +57,10 @@ CLOUDFLARE_CHAT_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id
 TTS_IGNORED_CHARS = str.maketrans({char: " " for char in ",!?/@*^$~`<>"})
 DB_LOCK = threading.Lock()
 INSTALL_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_ADMOB_KEYS: dict[int, str] = {}
+_ADMOB_KEYS_FETCHED_AT = 0.0
+_ADMOB_KEYS_LOCK = threading.Lock()
+ADMOB_KEYS_URL = "https://www.gstatic.com/admob/reward/verifier-keys.json"
 
 VOICE_SYSTEM_PROMPT = """
 당신은 친절하고 존중하는 한국어 AI 도우미이며 이름은 보이스입니다.
@@ -122,6 +130,15 @@ def init_db() -> None:
                 user_id TEXT NOT NULL, day TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (user_id, day)
             );
+            CREATE TABLE IF NOT EXISTS user_daily_bonus (
+                user_id TEXT NOT NULL, day TEXT NOT NULL,
+                granted INTEGER NOT NULL DEFAULT 0, used INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, day)
+            );
+            CREATE TABLE IF NOT EXISTS admob_reward_transactions (
+                transaction_id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+                day TEXT NOT NULL, amount INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS global_daily (
                 day TEXT PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0
             );
@@ -138,6 +155,10 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS tts_global_minute (
                 minute TEXT PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS quota_notice_daily (
+                user_id TEXT NOT NULL, day TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, day)
+            );
         """)
 
 
@@ -147,41 +168,162 @@ def reserve_request(user_id: str) -> tuple[str | None, int]:
     with DB_LOCK, connect_db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("INSERT OR IGNORE INTO user_daily(user_id, day) VALUES (?, ?)", (user_id, today))
+        conn.execute("INSERT OR IGNORE INTO user_daily_bonus(user_id, day) VALUES (?, ?)", (user_id, today))
         conn.execute("INSERT OR IGNORE INTO global_daily(day) VALUES (?)", (today,))
         conn.execute("INSERT OR IGNORE INTO global_minute(minute) VALUES (?)", (minute,))
         user_used = conn.execute("SELECT used FROM user_daily WHERE user_id=? AND day=?", (user_id, today)).fetchone()[0]
+        bonus = conn.execute("SELECT granted, used FROM user_daily_bonus WHERE user_id=? AND day=?", (user_id, today)).fetchone()
+        bonus_granted, bonus_used = bonus["granted"], bonus["used"]
         global_used = conn.execute("SELECT used FROM global_daily WHERE day=?", (today,)).fetchone()[0]
         minute_used = conn.execute("SELECT used FROM global_minute WHERE minute=?", (minute,)).fetchone()[0]
 
         if GLOBAL_DAILY_LIMIT > 0 and global_used >= GLOBAL_DAILY_LIMIT:
             conn.rollback()
-            return "global_limit", max(0, USER_DAILY_LIMIT - user_used)
+            return "global_limit", max(0, USER_DAILY_LIMIT + bonus_granted - user_used)
         if minute_used >= GLOBAL_RPM_LIMIT:
             conn.rollback()
-            return "rate_limit", max(0, USER_DAILY_LIMIT - user_used)
-        if user_used >= USER_DAILY_LIMIT:
+            return "rate_limit", max(0, USER_DAILY_LIMIT + bonus_granted - user_used - bonus_used)
+        if user_used >= USER_DAILY_LIMIT and bonus_used >= bonus_granted:
             conn.rollback()
             return "user_limit", 0
 
         conn.execute("UPDATE user_daily SET used=used+1 WHERE user_id=? AND day=?", (user_id, today))
+        if user_used >= USER_DAILY_LIMIT:
+            conn.execute("UPDATE user_daily_bonus SET used=used+1 WHERE user_id=? AND day=?", (user_id, today))
         conn.execute("UPDATE global_daily SET used=used+1 WHERE day=?", (today,))
         conn.execute("UPDATE global_minute SET used=used+1 WHERE minute=?", (minute,))
         conn.commit()
-        return None, max(0, USER_DAILY_LIMIT - user_used - 1)
+        return None, max(0, USER_DAILY_LIMIT + bonus_granted - user_used - 1)
 
 
-def reserve_tts(user_id: str) -> str | None:
+def quota_status(user_id: str) -> dict:
+    today = day_key()
+    with DB_LOCK, connect_db() as conn:
+        conn.execute("INSERT OR IGNORE INTO user_daily(user_id, day) VALUES (?, ?)", (user_id, today))
+        conn.execute("INSERT OR IGNORE INTO user_daily_bonus(user_id, day) VALUES (?, ?)", (user_id, today))
+        used = conn.execute("SELECT used FROM user_daily WHERE user_id=? AND day=?", (user_id, today)).fetchone()[0]
+        bonus = conn.execute("SELECT granted, used FROM user_daily_bonus WHERE user_id=? AND day=?", (user_id, today)).fetchone()
+        granted, bonus_used = bonus["granted"], bonus["used"]
+    return {
+        "used": used,
+        "remaining": max(0, USER_DAILY_LIMIT + granted - used),
+        "limit": USER_DAILY_LIMIT + granted,
+        "bonus_remaining": max(0, granted - bonus_used),
+    }
+
+
+def verify_admob_ssv(raw_query: str) -> tuple[dict | None, str | None]:
+    """Verify Google's signed callback without changing its signed query bytes."""
+    if not ADMOB_REWARDED_AD_UNIT_ID:
+        return None, "ad_unit_not_configured"
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.exceptions import InvalidSignature
+    except ImportError:
+        return None, "crypto_dependency_missing"
+
+    # Google signs the query before the final signature and key_id parameters.
+    decoded_query = unquote(raw_query)
+    query_parts = decoded_query.split("&")
+    if len(query_parts) < 3 or not query_parts[-2].startswith("signature=") or not query_parts[-1].startswith("key_id="):
+        return None, "invalid_signature_fields"
+    marker = "&signature="
+    signature_index = decoded_query.rfind(marker)
+    if signature_index < 0:
+        return None, "invalid_signature_fields"
+    signed_content = decoded_query[:signature_index].encode("utf-8")
+    params = parse_qs(decoded_query, keep_blank_values=True, strict_parsing=True)
+    try:
+        signature_text = params["signature"][0]
+        key_id = int(params["key_id"][0])
+        signature = base64.urlsafe_b64decode(signature_text + "=" * (-len(signature_text) % 4))
+        key_id_text = str(key_id)
+        if decoded_query.rsplit("&key_id=", 1)[-1] != key_id_text:
+            return None, "invalid_key_id"
+    except (KeyError, ValueError, TypeError):
+        return None, "invalid_signature_fields"
+
+    global _ADMOB_KEYS, _ADMOB_KEYS_FETCHED_AT
+    with _ADMOB_KEYS_LOCK:
+        if not _ADMOB_KEYS or time.time() - _ADMOB_KEYS_FETCHED_AT > 12 * 60 * 60:
+            try:
+                with urlopen(ADMOB_KEYS_URL, timeout=8) as response:
+                    key_doc = json.loads(response.read().decode("utf-8"))
+                _ADMOB_KEYS = {int(item["keyId"]): item["pem"] for item in key_doc.get("keys", [])}
+                _ADMOB_KEYS_FETCHED_AT = time.time()
+            except Exception as exc:
+                print(f"AdMob verifier-key refresh failed: {type(exc).__name__}", flush=True)
+                return None, "key_fetch_failed"
+        pem = _ADMOB_KEYS.get(key_id)
+    if not pem:
+        return None, "unknown_key_id"
+    try:
+        public_key = serialization.load_pem_public_key(pem.encode("ascii"))
+        public_key.verify(signature, signed_content, ec.ECDSA(hashes.SHA256()))
+    except (InvalidSignature, ValueError, TypeError):
+        return None, "signature_invalid"
+
+    try:
+        values = {name: items[0] for name, items in params.items()}
+        amount = int(values["reward_amount"])
+        user_id = values["user_id"]
+        transaction_id = values["transaction_id"]
+        if values["ad_unit"] != ADMOB_REWARDED_AD_UNIT_ID:
+            return None, "wrong_ad_unit"
+        if amount != ADMOB_REWARD_AMOUNT or values["reward_item"] != ADMOB_REWARD_ITEM:
+            return None, "wrong_reward"
+        if amount != 5 or not INSTALL_ID_RE.fullmatch(user_id):
+            return None, "invalid_reward_user"
+        if not re.fullmatch(r"[A-Fa-f0-9]{16,128}", transaction_id):
+            return None, "invalid_transaction_id"
+    except (KeyError, ValueError, TypeError):
+        return None, "missing_reward_fields"
+    return {"user_id": user_id, "transaction_id": transaction_id, "amount": amount}, None
+
+
+def grant_admob_reward(reward: dict) -> bool:
+    """Grant one signed reward once; return False when this transaction was seen."""
+    today = day_key()
+    with DB_LOCK, connect_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "INSERT INTO admob_reward_transactions(transaction_id, user_id, day, amount) VALUES (?, ?, ?, ?)",
+                (reward["transaction_id"], reward["user_id"], today, reward["amount"]),
+            )
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            return False
+        conn.execute("INSERT OR IGNORE INTO user_daily_bonus(user_id, day) VALUES (?, ?)", (reward["user_id"], today))
+        conn.execute(
+            "UPDATE user_daily_bonus SET granted=granted+? WHERE user_id=? AND day=?",
+            (reward["amount"], reward["user_id"], today),
+        )
+        conn.commit()
+    return True
+
+
+def reserve_tts(user_id: str, quota_notice: bool = False) -> str | None:
     """Bound speech usage per install, globally per day, and per minute."""
     today, minute = day_key(), minute_key()
     with DB_LOCK, connect_db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("INSERT OR IGNORE INTO tts_user_daily(user_id, day) VALUES (?, ?)", (user_id, today))
+        conn.execute("INSERT OR IGNORE INTO user_daily_bonus(user_id, day) VALUES (?, ?)", (user_id, today))
         conn.execute("INSERT OR IGNORE INTO tts_global_daily(day) VALUES (?)", (today,))
         conn.execute("INSERT OR IGNORE INTO tts_global_minute(minute) VALUES (?)", (minute,))
         user_used = conn.execute("SELECT used FROM tts_user_daily WHERE user_id=? AND day=?", (user_id, today)).fetchone()[0]
+        bonus_granted = conn.execute("SELECT granted FROM user_daily_bonus WHERE user_id=? AND day=?", (user_id, today)).fetchone()[0]
         global_used = conn.execute("SELECT used FROM tts_global_daily WHERE day=?", (today,)).fetchone()[0]
         minute_used = conn.execute("SELECT used FROM tts_global_minute WHERE minute=?", (minute,)).fetchone()[0]
-        if user_used >= TTS_DAILY_LIMIT:
+        if quota_notice:
+            conn.execute("INSERT OR IGNORE INTO quota_notice_daily(user_id, day) VALUES (?, ?)", (user_id, today))
+            notice_used = conn.execute("SELECT used FROM quota_notice_daily WHERE user_id=? AND day=?", (user_id, today)).fetchone()[0]
+            if notice_used >= 1:
+                conn.rollback()
+                return "user_limit"
+        elif user_used >= TTS_DAILY_LIMIT + bonus_granted:
             conn.rollback()
             return "user_limit"
         if global_used >= TTS_GLOBAL_DAILY_LIMIT:
@@ -190,7 +332,10 @@ def reserve_tts(user_id: str) -> str | None:
         if minute_used >= TTS_GLOBAL_RPM_LIMIT:
             conn.rollback()
             return "rate_limit"
-        conn.execute("UPDATE tts_user_daily SET used=used+1 WHERE user_id=? AND day=?", (user_id, today))
+        if quota_notice:
+            conn.execute("UPDATE quota_notice_daily SET used=used+1 WHERE user_id=? AND day=?", (user_id, today))
+        else:
+            conn.execute("UPDATE tts_user_daily SET used=used+1 WHERE user_id=? AND day=?", (user_id, today))
         conn.execute("UPDATE tts_global_daily SET used=used+1 WHERE day=?", (today,))
         conn.execute("UPDATE tts_global_minute SET used=used+1 WHERE minute=?", (minute,))
         conn.commit()
@@ -384,7 +529,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self) -> None:
-        if self.path == "/health":
+        parsed = urlsplit(self.path)
+        if parsed.path == "/health":
             self.send_json(200, {
                 "ok": True,
                 "tts_configured": bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID),
@@ -396,6 +542,28 @@ class Handler(BaseHTTPRequestHandler):
                     "gemini": bool(GEMINI_API_KEY),
                 },
             })
+        elif parsed.path == "/quota":
+            install_id = self.headers.get("X-Install-Id", "").strip()
+            if not INSTALL_ID_RE.fullmatch(install_id):
+                self.send_json(400, error_payload("invalid_user", "앱 식별 정보가 올바르지 않습니다."))
+                return
+            try:
+                self.send_json(200, quota_status(install_id))
+            except sqlite3.Error:
+                self.send_json(503, error_payload("server_error", "사용량 저장소에 문제가 생겼습니다."))
+        elif parsed.path == "/admob/ssv":
+            reward, error = verify_admob_ssv(parsed.query)
+            if error:
+                print(f"AdMob reward callback rejected: {error}", flush=True)
+                self.send_json(400, {"error": error})
+                return
+            try:
+                grant_admob_reward(reward)
+                # Acknowledge a valid duplicate too: Google should not retry an already-applied reward.
+                self.send_json(200, {"ok": True})
+            except sqlite3.Error as exc:
+                print(f"AdMob reward grant failed: {type(exc).__name__}", flush=True)
+                self.send_json(500, {"error": "reward_store_error"})
         else:
             self.send_json(404, {"error": "not_found", "message": "요청한 주소를 찾을 수 없습니다."})
 
@@ -450,29 +618,35 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(429, error_payload("rate_limit", "요청이 너무 많아요. 잠시 후 다시 시도해 주세요.", remaining))
             return
         if denial == "user_limit":
-            self.send_json(429, error_payload("user_limit", "오늘 사용할 수 있는 질문을 모두 사용했어요.", 0))
+            status = quota_status(install_id)
+            self.send_json(429, error_payload(
+                "user_limit", "오늘 AI 한도를 모두 사용했습니다. 내일 다시 이용해 주세요",
+                0, status["limit"],
+            ))
             return
 
         try:
             normalized = ask_providers(messages)
+            quota = quota_status(install_id)
             self.send_json(200, {
                 "answer": normalized["answer"],
                 "tts": normalized["tts"],
                 "visuals": normalized["visuals"],
                 "remaining": remaining,
-                "limit": USER_DAILY_LIMIT,
+                "limit": quota["limit"],
             })
         except Exception as exc:
             # The server process must survive unexpected parsing/provider failures.
             # Keep the response schema stable even in this last-resort path.
             print(f"AI fallback handler failed: {type(exc).__name__}", flush=True)
             emergency = "지금은 AI 답변을 만들 수 없습니다. 잠시 후 다시 시도해 주세요."
+            quota = quota_status(install_id)
             self.send_json(200, {
                 "answer": emergency,
                 "tts": emergency,
                 "visuals": [],
                 "remaining": remaining,
-                "limit": USER_DAILY_LIMIT,
+                "limit": quota["limit"],
             })
 
     def do_speak(self) -> None:
@@ -504,7 +678,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            denial = reserve_tts(install_id)
+            quota_notice = text == "오늘 AI 한도를 모두 사용했습니다. 내일 다시 이용해 주세요"
+            denial = reserve_tts(install_id, quota_notice=quota_notice)
         except sqlite3.Error:
             self.send_json(503, error_payload("server_error", "사용량 저장소에 문제가 생겼습니다."))
             return
