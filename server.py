@@ -617,7 +617,9 @@ class Handler(BaseHTTPRequestHandler):
         request = Request(endpoint, data=payload, headers={
             "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
             "Content-Type": "application/json",
-            "Accept": "audio/mpeg, application/json",
+            # Ask Workers AI for its JSON/base64 form so we can decode and
+            # validate the MP3 before forwarding it to Unity.
+            "Accept": "application/json",
             "User-Agent": "UnityVoice-Backend/1.0",
         }, method="POST")
         with urlopen(request, timeout=45) as response:
@@ -633,6 +635,18 @@ class Handler(BaseHTTPRequestHandler):
             data = base64.b64decode(audio_base64, validate=True)
         if not data:
             raise ValueError("Cloudflare MeloTTS returned empty audio")
+        # MeloTTS documents MP3 output. Reject a JSON/error page or another
+        # unexpected payload instead of labeling it audio/mpeg for Unity.
+        has_id3 = data.startswith(b"ID3")
+        has_mpeg_frame = len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0
+        if not (has_id3 or has_mpeg_frame):
+            preview = data[:8].hex()
+            print(
+                f"Cloudflare MeloTTS returned non-MP3 data: bytes={len(data)} "
+                f"content_type={content_type or 'unknown'} prefix={preview}",
+                flush=True,
+            )
+            raise ValueError("Cloudflare MeloTTS response is not MP3 audio")
         return data
 
 
