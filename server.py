@@ -516,11 +516,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            audio = self.generate_cloudflare_speech(text)
+            audio, audio_content_type = self.generate_cloudflare_speech(text)
             if not audio:
                 raise ValueError("empty speech response")
             self.send_response(200)
-            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Content-Type", audio_content_type)
             self.send_header("Content-Length", str(len(audio)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -600,8 +600,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(502, error_payload("transcription_error", "음성을 글자로 바꾸지 못했습니다. 잠시 후 다시 시도해 주세요."))
 
     @staticmethod
-    def generate_cloudflare_speech(text: str) -> bytes:
-        """Synthesize Korean MP3 with Cloudflare Workers AI MeloTTS."""
+    def generate_cloudflare_speech(text: str) -> tuple[bytes, str]:
+        """Synthesize Korean audio with Cloudflare Workers AI MeloTTS."""
         if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
             raise RuntimeError("Cloudflare Workers AI token or account ID is not configured")
         if not re.fullmatch(r"[A-Za-z0-9-]{8,64}", CLOUDFLARE_ACCOUNT_ID):
@@ -618,7 +618,7 @@ class Handler(BaseHTTPRequestHandler):
             "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
             "Content-Type": "application/json",
             # Ask Workers AI for its JSON/base64 form so we can decode and
-            # validate the MP3 before forwarding it to Unity.
+            # validate the audio before forwarding it to Unity.
             "Accept": "application/json",
             "User-Agent": "UnityVoice-Backend/1.0",
         }, method="POST")
@@ -635,19 +635,21 @@ class Handler(BaseHTTPRequestHandler):
             data = base64.b64decode(audio_base64, validate=True)
         if not data:
             raise ValueError("Cloudflare MeloTTS returned empty audio")
-        # MeloTTS documents MP3 output. Reject a JSON/error page or another
-        # unexpected payload instead of labeling it audio/mpeg for Unity.
+        # Workers AI's live response may be WAV even though the model schema
+        # advertises MP3. Detect the container and tell Unity the real format.
+        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+            return data, "audio/wav"
         has_id3 = data.startswith(b"ID3")
         has_mpeg_frame = len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0
         if not (has_id3 or has_mpeg_frame):
             preview = data[:8].hex()
             print(
-                f"Cloudflare MeloTTS returned non-MP3 data: bytes={len(data)} "
+                f"Cloudflare MeloTTS returned unrecognized audio data: bytes={len(data)} "
                 f"content_type={content_type or 'unknown'} prefix={preview}",
                 flush=True,
             )
-            raise ValueError("Cloudflare MeloTTS response is not MP3 audio")
-        return data
+            raise ValueError("Cloudflare MeloTTS response is neither WAV nor MP3 audio")
+        return data, "audio/mpeg"
 
 
 if __name__ == "__main__":
