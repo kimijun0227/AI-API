@@ -1,32 +1,28 @@
-"""Small single-instance API server for the Unity AI client."""
+"""Small single-instance API server for the Unity AI client with AdMob SSV support."""
 from __future__ import annotations
 
 import json
-import base64
-import io
 import os
 import re
 import sqlite3
 import threading
 import time
-import wave
+import asyncio
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from urllib.parse import urlparse, parse_qs
 from zoneinfo import ZoneInfo
+import edge_tts
 
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("AI_DB_PATH", str(ROOT / "ai_usage.sqlite3")))
 TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Asia/Seoul"))
 USER_DAILY_LIMIT = int(os.getenv("USER_DAILY_LIMIT", "10"))
-ADMOB_REWARDED_AD_UNIT_ID = os.getenv("ADMOB_REWARDED_AD_UNIT_ID", "").strip()
-ADMOB_REWARD_AMOUNT = int(os.getenv("ADMOB_REWARD_AMOUNT", "5"))
-ADMOB_REWARD_ITEM = os.getenv("ADMOB_REWARD_ITEM", "AI 질문").strip()
-GLOBAL_DAILY_LIMIT = int(os.getenv("GLOBAL_DAILY_LIMIT", "0"))
+GLOBAL_DAILY_LIMIT = int(os.getenv("GLOBAL_DAILY_LIMIT", "1000"))
 GLOBAL_RPM_LIMIT = int(os.getenv("GLOBAL_RPM_LIMIT", "20"))
 MAX_QUESTION_CHARS = int(os.getenv("MAX_QUESTION_CHARS", "30"))
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "800"))
@@ -34,33 +30,14 @@ TTS_DAILY_LIMIT = int(os.getenv("TTS_DAILY_LIMIT", "10"))
 TTS_GLOBAL_DAILY_LIMIT = int(os.getenv("TTS_GLOBAL_DAILY_LIMIT", "1000"))
 TTS_GLOBAL_RPM_LIMIT = int(os.getenv("TTS_GLOBAL_RPM_LIMIT", "20"))
 MAX_TTS_CHARS = int(os.getenv("MAX_TTS_CHARS", "2000"))
-MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "").strip()
-CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "llama3.1-8b")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
-CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
-CLOUDFLARE_MODEL = os.getenv("CLOUDFLARE_MODEL", "@cf/meta/llama-3.1-8b-instruct")
-CLOUDFLARE_TTS_MODEL = os.getenv("CLOUDFLARE_TTS_MODEL", "@cf/myshell-ai/melotts").strip()
-CLOUDFLARE_TTS_LANG = os.getenv("CLOUDFLARE_TTS_LANG", "KR").strip()
-PROVIDER_TIMEOUT_SECONDS = float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "7"))
-MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
-MAX_HISTORY_CHARS = int(os.getenv("MAX_HISTORY_CHARS", "1000"))
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-CLOUDFLARE_CHAT_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
-# These characters should be ignored by speech synthesis. Replace them with
-# spaces so adjacent words do not accidentally run together.
-TTS_IGNORED_CHARS = str.maketrans({char: " " for char in ",!?/@*^$~`<>"})
+GROQ_URL = "https://groq.com"
+TTS_VOICE = "ko-KR-InJoonNeural"
+
+TTS_IGNORED_CHARS = str.maketrans({char: " " for char in ".,!?/@*^$~`<>"})
 DB_LOCK = threading.Lock()
 INSTALL_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
-_ADMOB_KEYS: dict[int, str] = {}
-_ADMOB_KEYS_FETCHED_AT = 0.0
-_ADMOB_KEYS_LOCK = threading.Lock()
-ADMOB_KEYS_URL = "https://www.gstatic.com/admob/reward/verifier-keys.json"
 
 VOICE_SYSTEM_PROMPT = """
 당신은 친절하고 존중하는 한국어 AI 도우미이며 이름은 보이스입니다.
@@ -130,15 +107,6 @@ def init_db() -> None:
                 user_id TEXT NOT NULL, day TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (user_id, day)
             );
-            CREATE TABLE IF NOT EXISTS user_daily_bonus (
-                user_id TEXT NOT NULL, day TEXT NOT NULL,
-                granted INTEGER NOT NULL DEFAULT 0, used INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (user_id, day)
-            );
-            CREATE TABLE IF NOT EXISTS admob_reward_transactions (
-                transaction_id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
-                day TEXT NOT NULL, amount INTEGER NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS global_daily (
                 day TEXT PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0
             );
@@ -155,175 +123,61 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS tts_global_minute (
                 minute TEXT PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0
             );
-            CREATE TABLE IF NOT EXISTS quota_notice_daily (
-                user_id TEXT NOT NULL, day TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0,
+            CREATE TABLE IF NOT EXISTS user_bonus (
+                user_id TEXT NOT NULL, day TEXT NOT NULL, bonus_remaining INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (user_id, day)
             );
         """)
-
-
 def reserve_request(user_id: str) -> tuple[str | None, int]:
     """Atomically check and reserve a request before calling Groq."""
     today, minute = day_key(), minute_key()
     with DB_LOCK, connect_db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("INSERT OR IGNORE INTO user_daily(user_id, day) VALUES (?, ?)", (user_id, today))
-        conn.execute("INSERT OR IGNORE INTO user_daily_bonus(user_id, day) VALUES (?, ?)", (user_id, today))
         conn.execute("INSERT OR IGNORE INTO global_daily(day) VALUES (?)", (today,))
         conn.execute("INSERT OR IGNORE INTO global_minute(minute) VALUES (?)", (minute,))
+        conn.execute("INSERT OR IGNORE INTO user_bonus(user_id, day) VALUES (?, ?)", (user_id, today))
+        
         user_used = conn.execute("SELECT used FROM user_daily WHERE user_id=? AND day=?", (user_id, today)).fetchone()[0]
-        bonus = conn.execute("SELECT granted, used FROM user_daily_bonus WHERE user_id=? AND day=?", (user_id, today)).fetchone()
-        bonus_granted, bonus_used = bonus["granted"], bonus["used"]
         global_used = conn.execute("SELECT used FROM global_daily WHERE day=?", (today,)).fetchone()[0]
         minute_used = conn.execute("SELECT used FROM global_minute WHERE minute=?", (minute,)).fetchone()[0]
+        bonus_remaining = conn.execute("SELECT bonus_remaining FROM user_bonus WHERE user_id=? AND day=?", (user_id, today)).fetchone()[0]
 
-        if GLOBAL_DAILY_LIMIT > 0 and global_used >= GLOBAL_DAILY_LIMIT:
+        if global_used >= GLOBAL_DAILY_LIMIT:
             conn.rollback()
-            return "global_limit", max(0, USER_DAILY_LIMIT + bonus_granted - user_used)
+            return "global_limit", max(0, USER_DAILY_LIMIT - user_used)
         if minute_used >= GLOBAL_RPM_LIMIT:
             conn.rollback()
-            return "rate_limit", max(0, USER_DAILY_LIMIT + bonus_granted - user_used - bonus_used)
-        if user_used >= USER_DAILY_LIMIT and bonus_used >= bonus_granted:
-            conn.rollback()
-            return "user_limit", 0
+            return "rate_limit", max(0, USER_DAILY_LIMIT - user_used)
+            
+        if user_used >= USER_DAILY_LIMIT:
+            if bonus_remaining > 0:
+                conn.execute("UPDATE user_bonus SET bonus_remaining = bonus_remaining - 1 WHERE user_id=? AND day=?", (user_id, today))
+                conn.commit()
+                return None, bonus_remaining - 1
+            else:
+                conn.rollback()
+                return "user_limit", 0
 
         conn.execute("UPDATE user_daily SET used=used+1 WHERE user_id=? AND day=?", (user_id, today))
-        if user_used >= USER_DAILY_LIMIT:
-            conn.execute("UPDATE user_daily_bonus SET used=used+1 WHERE user_id=? AND day=?", (user_id, today))
         conn.execute("UPDATE global_daily SET used=used+1 WHERE day=?", (today,))
         conn.execute("UPDATE global_minute SET used=used+1 WHERE minute=?", (minute,))
         conn.commit()
-        return None, max(0, USER_DAILY_LIMIT + bonus_granted - user_used - 1)
+        return None, max(0, USER_DAILY_LIMIT - user_used - 1)
 
 
-def quota_status(user_id: str) -> dict:
-    today = day_key()
-    with DB_LOCK, connect_db() as conn:
-        conn.execute("INSERT OR IGNORE INTO user_daily(user_id, day) VALUES (?, ?)", (user_id, today))
-        conn.execute("INSERT OR IGNORE INTO user_daily_bonus(user_id, day) VALUES (?, ?)", (user_id, today))
-        used = conn.execute("SELECT used FROM user_daily WHERE user_id=? AND day=?", (user_id, today)).fetchone()[0]
-        bonus = conn.execute("SELECT granted, used FROM user_daily_bonus WHERE user_id=? AND day=?", (user_id, today)).fetchone()
-        granted, bonus_used = bonus["granted"], bonus["used"]
-    return {
-        "used": used,
-        "remaining": max(0, USER_DAILY_LIMIT + granted - used),
-        "limit": USER_DAILY_LIMIT + granted,
-        "bonus_remaining": max(0, granted - bonus_used),
-    }
-
-
-def verify_admob_ssv(raw_query: str) -> tuple[dict | None, str | None]:
-    """Verify Google's signed callback without changing its signed query bytes."""
-    if not ADMOB_REWARDED_AD_UNIT_ID:
-        return None, "ad_unit_not_configured"
-    try:
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import ec
-        from cryptography.exceptions import InvalidSignature
-    except ImportError:
-        return None, "crypto_dependency_missing"
-
-    # Google signs the query before the final signature and key_id parameters.
-    decoded_query = unquote(raw_query)
-    query_parts = decoded_query.split("&")
-    if len(query_parts) < 3 or not query_parts[-2].startswith("signature=") or not query_parts[-1].startswith("key_id="):
-        return None, "invalid_signature_fields"
-    marker = "&signature="
-    signature_index = decoded_query.rfind(marker)
-    if signature_index < 0:
-        return None, "invalid_signature_fields"
-    signed_content = decoded_query[:signature_index].encode("utf-8")
-    params = parse_qs(decoded_query, keep_blank_values=True, strict_parsing=True)
-    try:
-        signature_text = params["signature"][0]
-        key_id = int(params["key_id"][0])
-        signature = base64.urlsafe_b64decode(signature_text + "=" * (-len(signature_text) % 4))
-        key_id_text = str(key_id)
-        if decoded_query.rsplit("&key_id=", 1)[-1] != key_id_text:
-            return None, "invalid_key_id"
-    except (KeyError, ValueError, TypeError):
-        return None, "invalid_signature_fields"
-
-    global _ADMOB_KEYS, _ADMOB_KEYS_FETCHED_AT
-    with _ADMOB_KEYS_LOCK:
-        if not _ADMOB_KEYS or time.time() - _ADMOB_KEYS_FETCHED_AT > 12 * 60 * 60:
-            try:
-                with urlopen(ADMOB_KEYS_URL, timeout=8) as response:
-                    key_doc = json.loads(response.read().decode("utf-8"))
-                _ADMOB_KEYS = {int(item["keyId"]): item["pem"] for item in key_doc.get("keys", [])}
-                _ADMOB_KEYS_FETCHED_AT = time.time()
-            except Exception as exc:
-                print(f"AdMob verifier-key refresh failed: {type(exc).__name__}", flush=True)
-                return None, "key_fetch_failed"
-        pem = _ADMOB_KEYS.get(key_id)
-    if not pem:
-        return None, "unknown_key_id"
-    try:
-        public_key = serialization.load_pem_public_key(pem.encode("ascii"))
-        public_key.verify(signature, signed_content, ec.ECDSA(hashes.SHA256()))
-    except (InvalidSignature, ValueError, TypeError):
-        return None, "signature_invalid"
-
-    try:
-        values = {name: items[0] for name, items in params.items()}
-        amount = int(values["reward_amount"])
-        user_id = values["user_id"]
-        transaction_id = values["transaction_id"]
-        if values["ad_unit"] != ADMOB_REWARDED_AD_UNIT_ID:
-            return None, "wrong_ad_unit"
-        if amount != ADMOB_REWARD_AMOUNT or values["reward_item"] != ADMOB_REWARD_ITEM:
-            return None, "wrong_reward"
-        if amount != 5 or not INSTALL_ID_RE.fullmatch(user_id):
-            return None, "invalid_reward_user"
-        if not re.fullmatch(r"[A-Fa-f0-9]{16,128}", transaction_id):
-            return None, "invalid_transaction_id"
-    except (KeyError, ValueError, TypeError):
-        return None, "missing_reward_fields"
-    return {"user_id": user_id, "transaction_id": transaction_id, "amount": amount}, None
-
-
-def grant_admob_reward(reward: dict) -> bool:
-    """Grant one signed reward once; return False when this transaction was seen."""
-    today = day_key()
-    with DB_LOCK, connect_db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            conn.execute(
-                "INSERT INTO admob_reward_transactions(transaction_id, user_id, day, amount) VALUES (?, ?, ?, ?)",
-                (reward["transaction_id"], reward["user_id"], today, reward["amount"]),
-            )
-        except sqlite3.IntegrityError:
-            conn.rollback()
-            return False
-        conn.execute("INSERT OR IGNORE INTO user_daily_bonus(user_id, day) VALUES (?, ?)", (reward["user_id"], today))
-        conn.execute(
-            "UPDATE user_daily_bonus SET granted=granted+? WHERE user_id=? AND day=?",
-            (reward["amount"], reward["user_id"], today),
-        )
-        conn.commit()
-    return True
-
-
-def reserve_tts(user_id: str, quota_notice: bool = False) -> str | None:
-    """Bound speech usage per install, globally per day, and per minute."""
+def reserve_tts(user_id: str) -> str | None:
+    """Bound Azure speech usage per install, globally per day, and per minute."""
     today, minute = day_key(), minute_key()
     with DB_LOCK, connect_db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("INSERT OR IGNORE INTO tts_user_daily(user_id, day) VALUES (?, ?)", (user_id, today))
-        conn.execute("INSERT OR IGNORE INTO user_daily_bonus(user_id, day) VALUES (?, ?)", (user_id, today))
         conn.execute("INSERT OR IGNORE INTO tts_global_daily(day) VALUES (?)", (today,))
         conn.execute("INSERT OR IGNORE INTO tts_global_minute(minute) VALUES (?)", (minute,))
         user_used = conn.execute("SELECT used FROM tts_user_daily WHERE user_id=? AND day=?", (user_id, today)).fetchone()[0]
-        bonus_granted = conn.execute("SELECT granted FROM user_daily_bonus WHERE user_id=? AND day=?", (user_id, today)).fetchone()[0]
         global_used = conn.execute("SELECT used FROM tts_global_daily WHERE day=?", (today,)).fetchone()[0]
         minute_used = conn.execute("SELECT used FROM tts_global_minute WHERE minute=?", (minute,)).fetchone()[0]
-        if quota_notice:
-            conn.execute("INSERT OR IGNORE INTO quota_notice_daily(user_id, day) VALUES (?, ?)", (user_id, today))
-            notice_used = conn.execute("SELECT used FROM quota_notice_daily WHERE user_id=? AND day=?", (user_id, today)).fetchone()[0]
-            if notice_used >= 1:
-                conn.rollback()
-                return "user_limit"
-        elif user_used >= TTS_DAILY_LIMIT + bonus_granted:
+        if user_used >= TTS_DAILY_LIMIT:
             conn.rollback()
             return "user_limit"
         if global_used >= TTS_GLOBAL_DAILY_LIMIT:
@@ -332,191 +186,37 @@ def reserve_tts(user_id: str, quota_notice: bool = False) -> str | None:
         if minute_used >= TTS_GLOBAL_RPM_LIMIT:
             conn.rollback()
             return "rate_limit"
-        if quota_notice:
-            conn.execute("UPDATE quota_notice_daily SET used=used+1 WHERE user_id=? AND day=?", (user_id, today))
-        else:
-            conn.execute("UPDATE tts_user_daily SET used=used+1 WHERE user_id=? AND day=?", (user_id, today))
+        conn.execute("UPDATE tts_user_daily SET used=used+1 WHERE user_id=? AND day=?", (user_id, today))
         conn.execute("UPDATE tts_global_daily SET used=used+1 WHERE day=?", (today,))
         conn.execute("UPDATE tts_global_minute SET used=used+1 WHERE minute=?", (minute,))
         conn.commit()
         return None
 
 
+def add_user_bonus(user_id: str, amount: int = 5) -> None:
+    """Increase rewarded bonus question count for the given user."""
+    today = day_key()
+    with DB_LOCK, connect_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT OR IGNORE INTO user_bonus(user_id, day) VALUES (?, ?)", (user_id, today))
+        conn.execute("UPDATE user_bonus SET bonus_remaining = bonus_remaining + ? WHERE user_id=? AND day=?", (amount, user_id, today))
+        conn.commit()
+
+
+def get_user_bonus(user_id: str) -> int:
+    """Fetch current rewarded bonus count for the given user."""
+    today = day_key()
+    with connect_db() as conn:
+        row = conn.execute("SELECT bonus_remaining FROM user_bonus WHERE user_id=? AND day=?", (user_id, today)).fetchone()
+        return row[0] if row else 0
+
+
 def error_payload(code: str, message: str, remaining: int = -1, limit: int = USER_DAILY_LIMIT) -> dict:
     return {"error": code, "message": message, "remaining": remaining, "limit": limit}
-
-
-class ProviderFailure(Exception):
-    """A provider failed or returned an unusable response; try the next provider."""
-
-
-def request_provider_json(url: str, payload: dict, headers: dict, provider: str) -> dict:
-    request = Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-    try:
-        with urlopen(request, timeout=PROVIDER_TIMEOUT_SECONDS) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        if not isinstance(result, dict):
-            raise ValueError("provider returned a non-object response")
-        return result
-    except HTTPError as exc:
-        # Never log provider response bodies: they may contain user content or sensitive data.
-        request_id = exc.headers.get("x-request-id", "") if exc.headers else ""
-        suffix = f" request_id={request_id}" if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id) else ""
-        print(f"{provider} HTTP {exc.code}{suffix}; trying next provider", flush=True)
-        raise ProviderFailure(f"{provider} HTTP {exc.code}") from exc
-    except (URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"{provider} request failed: {type(exc).__name__}; trying next provider", flush=True)
-        raise ProviderFailure(f"{provider} request failed") from exc
-
-
-def call_openai_compatible(provider: str, url: str, api_key: str, model: str, messages: list[dict]) -> str:
-    if not api_key:
-        raise ProviderFailure(f"{provider} API key is not configured")
-    payload = {
-        "model": model,
-        "messages": messages,
-        "response_format": {"type": "json_object"},
-        "max_tokens": MAX_OUTPUT_TOKENS,
-        "temperature": 0.5,
-    }
-    result = request_provider_json(url, payload, {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "User-Agent": "UnityVoice-Backend/1.0",
-    }, provider)
-    try:
-        content = result["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise ProviderFailure(f"{provider} returned an invalid completion") from exc
-    if not isinstance(content, str) or not content.strip():
-        raise ProviderFailure(f"{provider} returned an empty completion")
-    return content.strip()
-
-
-def call_gemini(messages: list[dict]) -> str:
-    if not GEMINI_API_KEY:
-        raise ProviderFailure("Gemini API key is not configured")
-    system_text = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
-    contents = []
-    for message in messages:
-        if message["role"] == "system":
-            continue
-        role = "model" if message["role"] == "assistant" else "user"
-        # Gemini requires alternating roles; merge adjacent same-role turns safely.
-        if contents and contents[-1]["role"] == role:
-            contents[-1]["parts"][0]["text"] += "\n" + message["content"]
-        else:
-            contents.append({"role": role, "parts": [{"text": message["content"]}]})
-    payload = {
-        "systemInstruction": {"parts": [{"text": system_text}]},
-        "contents": contents,
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "maxOutputTokens": MAX_OUTPUT_TOKENS,
-            "temperature": 0.5,
-        },
-    }
-    url = GEMINI_URL.format(model=GEMINI_MODEL)
-    result = request_provider_json(url, payload, {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY,
-        "User-Agent": "UnityVoice-Backend/1.0",
-    }, "Gemini")
-    try:
-        parts = result["candidates"][0]["content"]["parts"]
-        content = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
-    except (KeyError, IndexError, TypeError) as exc:
-        raise ProviderFailure("Gemini returned an invalid completion") from exc
-    if not content.strip():
-        raise ProviderFailure("Gemini returned an empty completion")
-    return content.strip()
-
-
-def call_cloudflare(messages: list[dict]) -> str:
-    """Call Cloudflare Workers AI's OpenAI-compatible chat completions endpoint."""
-    if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
-        raise ProviderFailure("Cloudflare token or account ID is not configured")
-    url = CLOUDFLARE_CHAT_URL.format(account_id=CLOUDFLARE_ACCOUNT_ID)
-    return call_openai_compatible(
-        "Cloudflare Workers AI",
-        url,
-        CLOUDFLARE_API_TOKEN,
-        CLOUDFLARE_MODEL,
-        messages,
-    )
-
-
-def parse_assistant_json(content: str) -> dict:
-    structured = content.strip()
-    if structured.startswith("```"):
-        structured = re.sub(r"^```(?:json)?\s*|\s*```$", "", structured, flags=re.IGNORECASE)
-    parsed = json.loads(structured)
-    if not isinstance(parsed, dict):
-        raise ValueError("completion is not a JSON object")
-    answer = parsed.get("answer")
-    if not isinstance(answer, str) or not answer.strip():
-        raise ValueError("completion is missing answer")
-    tts_text = parsed.get("tts", answer)
-    visuals = parsed.get("visuals", [])
-    if not isinstance(tts_text, str):
-        tts_text = answer
-    if not isinstance(visuals, list):
-        visuals = []
-    return {
-        "answer": answer.strip(),
-        "tts": preprocess_tts_text(tts_text),
-        "visuals": [preprocess_tts_text(step)[:100] for step in visuals if isinstance(step, str) and preprocess_tts_text(step)][:4],
-    }
-
-
-def build_chat_messages(body: dict, question: str) -> list[dict]:
-    """Keep a bounded user/assistant history while owning the system prompt server-side."""
-    source = body.get("history", body.get("messages", []))
-    if source is None:
-        source = []
-    if not isinstance(source, list):
-        raise ValueError("history must be an array")
-    history = []
-    for item in source[-MAX_HISTORY_MESSAGES:]:
-        if not isinstance(item, dict):
-            continue
-        role = item.get("role")
-        content = item.get("content")
-        if role not in ("user", "assistant") or not isinstance(content, str) or not content.strip():
-            continue
-        history.append({"role": role, "content": content.strip()[:MAX_HISTORY_CHARS]})
-    return [{"role": "system", "content": VOICE_SYSTEM_PROMPT}, *history, {"role": "user", "content": question}]
-
-
-def ask_providers(messages: list[dict]) -> dict:
-    """Use Groq, Cerebras, Cloudflare Workers AI, then Gemini."""
-    providers = [
-        ("Groq", GROQ_API_KEY, lambda: call_openai_compatible("Groq", GROQ_URL, GROQ_API_KEY, MODEL, messages)),
-        ("Cerebras", CEREBRAS_API_KEY, lambda: call_openai_compatible("Cerebras", CEREBRAS_URL, CEREBRAS_API_KEY, CEREBRAS_MODEL, messages)),
-        ("Cloudflare Workers AI", bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID), lambda: call_cloudflare(messages)),
-        ("Gemini", GEMINI_API_KEY, lambda: call_gemini(messages)),
-    ]
-    for name, key, request in providers:
-        if not key:
-            print(f"{name} skipped: API key is not configured", flush=True)
-            continue
-        try:
-            normalized = parse_assistant_json(request())
-            print(f"AI response provider={name}", flush=True)
-            return normalized
-        except Exception as exc:
-            print(f"{name} unusable: {type(exc).__name__}; trying next provider", flush=True)
-
-    # Keep the mobile client alive and return the exact same success schema.
-    emergency = "지금은 AI 답변을 만들 수 없습니다. 잠시 후 다시 시도해 주세요."
-    return {"answer": emergency, "tts": emergency, "visuals": []}
-
-
 class Handler(BaseHTTPRequestHandler):
     server_version = "PersonalAI/1.0"
 
     def log_message(self, fmt: str, *args) -> None:
-        # Avoid logging user questions, install IDs, or provider credentials.
         print(f"{self.log_date_time_string()} {self.address_string()} {fmt % args}")
 
     def send_json(self, status: int, payload: dict) -> None:
@@ -528,44 +228,55 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def do_HEAD(self) -> None:
+        """Handle Render load balancer health checks to avoid 501 errors."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+
     def do_GET(self) -> None:
-        parsed = urlsplit(self.path)
-        if parsed.path == "/health":
-            self.send_json(200, {
-                "ok": True,
-                "tts_configured": bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID),
-                "tts_provider": "cloudflare-workers-ai-melotts",
-                "ai_providers": {
-                    "groq": bool(GROQ_API_KEY),
-                    "cerebras": bool(CEREBRAS_API_KEY),
-                    "cloudflare_workers_ai": bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID),
-                    "gemini": bool(GEMINI_API_KEY),
-                },
-            })
-        elif parsed.path == "/quota":
+        parsed_url = urlparse(self.path)
+        query_params = parse_qs(parsed_url.query)
+
+        if parsed_url.path == "/health":
+            self.send_json(200, {"ok": True, "tts_configured": True, "tts_provider": "edge-tts"})
+            return
+            
+        elif parsed_url.path == "/admob/ssv":
+            user_ids = query_params.get("user_id")
+            if not user_ids:
+                self.send_response(200)
+                self.end_headers()
+                return
+
+            install_id = user_ids[0].strip()
+            if not INSTALL_ID_RE.fullmatch(install_id):
+                self.send_json(400, {"error": "invalid_user"})
+                return
+
+            try:
+                add_user_bonus(install_id, 5)
+                print(f"AdMob SSV Successfully credited 5 questions to {install_id}", flush=True)
+                self.send_response(200)
+                self.end_headers()
+            except sqlite3.Error:
+                self.send_json(500, {"error": "database_error"})
+            return
+            
+        elif parsed_url.path == "/quota":
             install_id = self.headers.get("X-Install-Id", "").strip()
             if not INSTALL_ID_RE.fullmatch(install_id):
-                self.send_json(400, error_payload("invalid_user", "앱 식별 정보가 올바르지 않습니다."))
+                self.send_json(400, {"error": "invalid_user"})
                 return
+            
             try:
-                self.send_json(200, quota_status(install_id))
+                bonus = get_user_bonus(install_id)
+                self.send_json(200, {"bonus_remaining": bonus})
             except sqlite3.Error:
-                self.send_json(503, error_payload("server_error", "사용량 저장소에 문제가 생겼습니다."))
-        elif parsed.path == "/admob/ssv":
-            reward, error = verify_admob_ssv(parsed.query)
-            if error:
-                print(f"AdMob reward callback rejected: {error}", flush=True)
-                self.send_json(400, {"error": error})
-                return
-            try:
-                grant_admob_reward(reward)
-                # Acknowledge a valid duplicate too: Google should not retry an already-applied reward.
-                self.send_json(200, {"ok": True})
-            except sqlite3.Error as exc:
-                print(f"AdMob reward grant failed: {type(exc).__name__}", flush=True)
-                self.send_json(500, {"error": "reward_store_error"})
-        else:
-            self.send_json(404, {"error": "not_found", "message": "요청한 주소를 찾을 수 없습니다."})
+                self.send_json(500, {"error": "database_error"})
+            return
+
+        self.send_json(404, {"error": "not_found", "message": "요청한 주소를 찾을 수 없습니다."})
 
     def do_POST(self) -> None:
         if self.path == "/speak":
@@ -577,13 +288,17 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/ask":
             self.send_json(404, {"error": "not_found", "message": "요청한 주소를 찾을 수 없습니다."})
             return
+        if not GROQ_API_KEY:
+            self.send_json(503, error_payload("server_error", "서버에 Groq API 키가 설정되지 않았습니다."))
+            return
+
         install_id = self.headers.get("X-Install-Id", "").strip()
         if not INSTALL_ID_RE.fullmatch(install_id):
             self.send_json(400, error_payload("invalid_user", "앱 식별 정보가 올바르지 않습니다."))
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length < 1 or length > 65_536:
+            if length < 1 or length > 16_384:
                 raise ValueError("invalid content length")
             body = json.loads(self.rfile.read(length).decode("utf-8"))
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
@@ -595,15 +310,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, error_payload("invalid_request", "질문을 입력해 주세요."))
             return
         question = question.strip()
-        # Python len counts Unicode code points, matching AITextUtil.CountChars.
         if len(question) > MAX_QUESTION_CHARS:
             self.send_json(400, error_payload("too_long", f"질문은 {MAX_QUESTION_CHARS}자까지만 보낼 수 있어요."))
-            return
-
-        try:
-            messages = build_chat_messages(body, question)
-        except (ValueError, TypeError):
-            self.send_json(400, error_payload("invalid_request", "대화 기록 형식을 확인해 주세요."))
             return
 
         try:
@@ -618,36 +326,86 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(429, error_payload("rate_limit", "요청이 너무 많아요. 잠시 후 다시 시도해 주세요.", remaining))
             return
         if denial == "user_limit":
-            status = quota_status(install_id)
-            self.send_json(429, error_payload(
-                "user_limit", "오늘 AI 한도를 모두 사용했습니다. 내일 다시 이용해 주세요",
-                0, status["limit"],
-            ))
+            self.send_json(429, error_payload("user_limit", "오늘 사용할 수 있는 질문을 모두 사용했어요.", 0))
             return
 
+        payload = {
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": VOICE_SYSTEM_PROMPT},
+                {"role": "user", "content": question},
+            ],
+            "max_completion_tokens": MAX_OUTPUT_TOKENS,
+            "temperature": 0.5,
+        }
+        req = Request(GROQ_URL, data=json.dumps(payload).encode("utf-8"), headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": "UnityAI-Groq-Server/1.0",
+        }, method="POST")
         try:
-            normalized = ask_providers(messages)
-            quota = quota_status(install_id)
+            with urlopen(req, timeout=30) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            completion = result["choices"][0]["message"]["content"]
+            if not isinstance(completion, str) or not completion.strip():
+                raise ValueError("empty completion")
+            structured = completion.strip()
+            if structured.startswith("```"):
+                structured = re.sub(r"^```(?:json)?\s*|\s*```$", "", structured, flags=re.IGNORECASE)
+            try:
+                parsed = json.loads(structured)
+            except json.JSONDecodeError:
+                parsed = {"answer": completion.strip()}
+            answer = parsed.get("answer", completion.strip()) if isinstance(parsed, dict) else completion.strip()
+            tts_text = parsed.get("tts", answer) if isinstance(parsed, dict) else answer
+            visual_steps = parsed.get("visuals", []) if isinstance(parsed, dict) else []
+            if not isinstance(answer, str) or not answer.strip():
+                answer = completion.strip()
+            if not isinstance(tts_text, str) or not tts_text.strip():
+                tts_text = answer
+            if not isinstance(visual_steps, list):
+                visual_steps = []
+            visuals = [preprocess_tts_text(step)[:100] for step in visual_steps if isinstance(step, str)]
+            visuals = [step for step in visuals if step][:4]
             self.send_json(200, {
-                "answer": normalized["answer"],
-                "tts": normalized["tts"],
-                "visuals": normalized["visuals"],
+                "answer": answer.strip(),
+                "tts": preprocess_tts_text(tts_text),
+                "visuals": visuals,
                 "remaining": remaining,
-                "limit": quota["limit"],
+                "limit": USER_DAILY_LIMIT,
             })
-        except Exception as exc:
-            # The server process must survive unexpected parsing/provider failures.
-            # Keep the response schema stable even in this last-resort path.
-            print(f"AI fallback handler failed: {type(exc).__name__}", flush=True)
-            emergency = "지금은 AI 답변을 만들 수 없습니다. 잠시 후 다시 시도해 주세요."
-            quota = quota_status(install_id)
-            self.send_json(200, {
-                "answer": emergency,
-                "tts": emergency,
-                "visuals": [],
-                "remaining": remaining,
-                "limit": quota["limit"],
-            })
+        except HTTPError as exc:
+            if exc.code == 429:
+                self.send_json(429, error_payload("rate_limit", "Groq 요청 한도에 도달했습니다. 잠시 후 다시 시도해 주세요.", remaining))
+            else:
+                detail = ""
+                raw_body = ""
+                try:
+                    raw_body = exc.read().decode("utf-8", errors="replace")
+                    parsed = json.loads(raw_body)
+                    provider_error = parsed.get("error", parsed) if isinstance(parsed, dict) else parsed
+                    if isinstance(provider_error, dict):
+                        code = str(provider_error.get("code") or provider_error.get("type") or "")
+                        message = str(provider_error.get("message") or provider_error.get("detail") or "")
+                        if code: detail += f" [{code}]"
+                        if message: detail += f" {message}"
+                    elif provider_error:
+                        detail = f" {provider_error}"
+                except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError):
+                    detail = f" {raw_body}"
+                if not detail and raw_body:
+                    detail = f" {raw_body}"
+                if GROQ_API_KEY:
+                    detail = detail.replace(GROQ_API_KEY, "[redacted]")
+                detail = " ".join(detail.split())[:360]
+                request_id = exc.headers.get("x-request-id", "") if exc.headers else ""
+                if request_id and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id):
+                    detail += f" (request_id={request_id})"
+                print(f"Groq HTTP {exc.code}{detail}", flush=True)
+                self.send_json(502, error_payload("server_error", f"Groq HTTP {exc.code}{detail}", remaining))
+        except (URLError, TimeoutError, KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
+            print(f"Groq completion handling failed: {type(exc).__name__}", flush=True)
+            self.send_json(502, error_payload("server_error", "AI 답변을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.", remaining))
 
     def do_speak(self) -> None:
         install_id = self.headers.get("X-Install-Id", "").strip()
@@ -664,219 +422,120 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         text = body.get("text") if isinstance(body, dict) else None
-        if not isinstance(text, str) or not text.strip():
-            self.send_json(400, error_payload("invalid_request", "읽을 문장이 비어 있습니다."))
-            return
-        # Keep periods as sentence boundaries; other display punctuation is still omitted.
-        text = text.translate(TTS_IGNORED_CHARS)
-        text = " ".join(text.split())
-        if not text.strip(" ."):
-            self.send_json(400, error_payload("invalid_request", "읽을 문장에 음성으로 읽을 내용이 없습니다."))
-            return
-        if len(text) > MAX_TTS_CHARS:
-            self.send_json(400, error_payload("too_long", f"음성으로 읽을 문장은 {MAX_TTS_CHARS}자까지만 가능합니다."))
-            return
-
-        try:
-            quota_notice = text == "오늘 AI 한도를 모두 사용했습니다. 내일 다시 이용해 주세요"
-            denial = reserve_tts(install_id, quota_notice=quota_notice)
-        except sqlite3.Error:
-            self.send_json(503, error_payload("server_error", "사용량 저장소에 문제가 생겼습니다."))
-            return
-        if denial == "user_limit":
-            self.send_json(429, error_payload("tts_user_limit", "오늘 음성 재생 횟수를 모두 사용했습니다."))
-            return
-        if denial == "global_limit":
-            self.send_json(429, error_payload("tts_global_limit", "오늘 음성 사용량이 모두 소진되었습니다."))
-            return
-        if denial == "rate_limit":
-            self.send_json(429, error_payload("rate_limit", "음성 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요."))
-            return
-
-        try:
-            audio, audio_content_type = self.generate_cloudflare_speech_with_pauses(text)
-            if not audio:
-                raise ValueError("empty speech response")
-            self.send_response(200)
-            self.send_header("Content-Type", audio_content_type)
-            self.send_header("Content-Length", str(len(audio)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(audio)
-        except HTTPError as exc:
-            request_id = exc.headers.get("cf-ray", "") if exc.headers else ""
-            suffix = f" cf-ray={request_id}" if re.fullmatch(r"[A-Za-z0-9-]{1,128}", request_id) else ""
-            print(f"Cloudflare MeloTTS HTTP error {exc.code}{suffix}", flush=True)
-            self.send_json(502, error_payload("tts_provider_error", "음성 서비스 요청이 실패했습니다. 잠시 후 다시 시도해 주세요."))
-        except Exception as exc:
-            # Keep user text and credentials out of logs.
-            print(f"Cloudflare MeloTTS request failed: {type(exc).__name__}", flush=True)
-            self.send_json(502, error_payload("tts_provider_error", "음성을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요."))
-
-    def do_transcribe(self) -> None:
-        if not GROQ_API_KEY:
-            self.send_json(503, error_payload("server_error", "서버에 Groq API 키가 설정되지 않았습니다."))
-            return
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length < 44 or length > 5 * 1024 * 1024:
-                raise ValueError("invalid audio length")
-            audio = self.rfile.read(length)
-            if len(audio) != length or audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
-                raise ValueError("invalid wav audio")
-        except (ValueError, OverflowError):
-            self.send_json(400, error_payload("invalid_audio", "녹음 파일이 올바르지 않습니다."))
-            return
-
-        boundary = "----UnityVoiceBoundary7MA4YWxkTrZu0gW"
-        body = b"".join([
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3\r\n".encode("ascii"),
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\nko\r\n".encode("ascii"),
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n".encode("ascii"),
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"voice.wav\"\r\nContent-Type: audio/wav\r\n\r\n".encode("ascii"),
-            audio,
-            f"\r\n--{boundary}--\r\n".encode("ascii"),
-        ])
-        req = Request("https://api.groq.com/openai/v1/audio/transcriptions", data=body, headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "UnityAI-Groq-Server/1.0",
-        }, method="POST")
-        try:
-            with urlopen(req, timeout=60) as response:
-                result = json.loads(response.read().decode("utf-8"))
-            transcript = result.get("text", "") if isinstance(result, dict) else ""
-            if not isinstance(transcript, str) or not transcript.strip():
-                self.send_json(422, error_payload("empty_transcription", "말한 내용을 알아듣지 못했어요. 다시 말해 주세요."))
-                return
-            self.send_json(200, {"text": transcript.strip()})
-        except HTTPError as exc:
-            detail = ""
-            raw_body = ""
-            try:
-                raw_body = exc.read().decode("utf-8", errors="replace")
-                parsed = json.loads(raw_body)
-                provider_error = parsed.get("error", parsed) if isinstance(parsed, dict) else parsed
-                if isinstance(provider_error, dict):
-                    code = str(provider_error.get("code") or provider_error.get("type") or "")
-                    message = str(provider_error.get("message") or provider_error.get("detail") or "")
-                    detail = " ".join(part for part in (f"[{code}]" if code else "", message) if part)
-                elif provider_error:
-                    detail = str(provider_error)
-            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError):
-                detail = raw_body
-            if GROQ_API_KEY:
-                detail = detail.replace(GROQ_API_KEY, "[redacted]")
-            detail = " ".join(detail.split())[:320]
-            request_id = exc.headers.get("x-request-id", "") if exc.headers else ""
-            if request_id and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id):
-                detail += f" (request_id={request_id})"
-            print(f"Groq transcription HTTP {exc.code}{(' ' + detail) if detail else ''}", flush=True)
-            message = f"음성 인식 서비스 오류 (Groq HTTP {exc.code}{(' ' + detail) if detail else ''})"
-            self.send_json(502, error_payload("transcription_error", message))
-        except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError):
-            self.send_json(502, error_payload("transcription_error", "음성을 글자로 바꾸지 못했습니다. 잠시 후 다시 시도해 주세요."))
-
-    @staticmethod
-    def generate_cloudflare_speech_with_pauses(text: str) -> tuple[bytes, str]:
-        """Synthesize each period-delimited sentence and insert 0.8 seconds of silence."""
-        # Split after a period and its following whitespace, so decimal points such as 3.14 stay intact.
-        sentences = [part.strip() for part in re.split(r"(?<=\.)\s+", text.strip()) if part.strip(" .")]
-        if not sentences:
-            raise ValueError("speech text contains no readable sentence")
-        if len(sentences) == 1:
-            return Handler.generate_cloudflare_speech(sentences[0])
-
-        clips = [Handler.generate_cloudflare_speech(sentence) for sentence in sentences]
-        if any(content_type != "audio/wav" for _, content_type in clips):
-            raise ValueError("sentence pauses require WAV audio from the TTS provider")
-
-        audio_parts: list[bytes] = []
-        reference_params = None
-        sample_width = channels = sample_rate = 0
-        for audio, _ in clips:
-            with wave.open(io.BytesIO(audio), "rb") as source:
-                params = source.getparams()
-                if params.comptype != "NONE":
-                    raise ValueError("sentence pauses require uncompressed PCM WAV audio")
-                if reference_params is None:
-                    reference_params = params
-                    sample_width = params.sampwidth
-                    channels = params.nchannels
-                    sample_rate = params.framerate
-                elif (params.nchannels, params.sampwidth, params.framerate, params.comptype) != (
-                    channels, sample_width, sample_rate, reference_params.comptype
-                ):
-                    raise ValueError("TTS sentence audio formats do not match")
-                audio_parts.append(source.readframes(params.nframes))
-
-        silence_frame = b"\x80" if sample_width == 1 else b"\x00"
-        silence = silence_frame * int(sample_rate * 0.8) * channels * sample_width
-        output = io.BytesIO()
-        with wave.open(output, "wb") as combined:
-            combined.setparams(reference_params)
-            for index, frames in enumerate(audio_parts):
-                combined.writeframesraw(frames)
-                if index < len(audio_parts) - 1:
-                    combined.writeframesraw(silence)
-        return output.getvalue(), "audio/wav"
-
-    @staticmethod
-    def generate_cloudflare_speech(text: str) -> tuple[bytes, str]:
-        """Synthesize Korean audio with Cloudflare Workers AI MeloTTS."""
-        if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
-            raise RuntimeError("Cloudflare Workers AI token or account ID is not configured")
-        if not re.fullmatch(r"[A-Za-z0-9-]{8,64}", CLOUDFLARE_ACCOUNT_ID):
-            raise RuntimeError("Cloudflare account ID is invalid")
-        if not CLOUDFLARE_TTS_MODEL.startswith("@cf/"):
-            raise RuntimeError("Cloudflare TTS model is invalid")
-
-        endpoint = (
-            "https://api.cloudflare.com/client/v4/accounts/"
-            f"{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CLOUDFLARE_TTS_MODEL}"
-        )
-        payload = json.dumps({"prompt": text, "lang": CLOUDFLARE_TTS_LANG}).encode("utf-8")
-        request = Request(endpoint, data=payload, headers={
-            "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
-            "Content-Type": "application/json",
-            # Ask Workers AI for its JSON/base64 form so we can decode and
-            # validate the audio before forwarding it to Unity.
-            "Accept": "application/json",
-            "User-Agent": "UnityVoice-Backend/1.0",
-        }, method="POST")
-        with urlopen(request, timeout=45) as response:
-            data = response.read()
-            content_type = response.headers.get("Content-Type", "").lower()
-
-        if "json" in content_type or data.lstrip().startswith(b"{"):
-            result = json.loads(data.decode("utf-8"))
-            inner = result.get("result", result) if isinstance(result, dict) else {}
-            audio_base64 = inner.get("audio") if isinstance(inner, dict) else None
-            if not isinstance(audio_base64, str) or not audio_base64:
-                raise ValueError("Cloudflare MeloTTS response did not contain audio")
-            data = base64.b64decode(audio_base64, validate=True)
-        if not data:
-            raise ValueError("Cloudflare MeloTTS returned empty audio")
-        # Workers AI's live response may be WAV even though the model schema
-        # advertises MP3. Detect the container and tell Unity the real format.
-        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
-            return data, "audio/wav"
-        has_id3 = data.startswith(b"ID3")
-        has_mpeg_frame = len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0
-        if not (has_id3 or has_mpeg_frame):
-            preview = data[:8].hex()
-            print(
-                f"Cloudflare MeloTTS returned unrecognized audio data: bytes={len(data)} "
-                f"content_type={content_type or 'unknown'} prefix={preview}",
-                flush=True,
-            )
-            raise ValueError("Cloudflare MeloTTS response is neither WAV nor MP3 audio")
-        return data, "audio/mpeg"
-
-
-if __name__ == "__main__":
-    init_db()
-    host = os.getenv("HOST", "127.0.0.1")
-    port = int(os.getenv("PORT", "8000"))
-    print(f"AI server listening on {host}:{port}; model={MODEL}; timezone={TZ}")
-    ThreadingHTTPServer((host, port), Handler).serve_forever()
+if not isinstance(text, str) or not text.strip():
+self.send_json(400, error_payload("invalid_request", "읽을 문장이 비어 있습니다."))
+return
+text = text.translate(TTS_IGNORED_CHARS)
+text = " ".join(text.split())
+if not text:
+self.send_json(400, error_payload("invalid_request", "읽을 문장에 음성으로 읽을 내용이 없습니다."))
+return
+if len(text) > MAX_TTS_CHARS:
+self.send_json(400, error_payload("too_long", f"음성으로 읽을 문장은 {MAX_TTS_CHARS}자까지만 가능합니다."))
+return
+try:
+denial = reserve_tts(install_id)
+except sqlite3.Error:
+self.send_json(503, error_payload("server_error", "사용량 저장소에 문제가 생겼습니다."))
+return
+if denial == "user_limit":
+self.send_json(429, error_payload("tts_user_limit", "오늘 음성 재생 횟수를 모두 사용했습니다."))
+return
+if denial == "global_limit":
+self.send_json(429, error_payload("tts_global_limit", "오늘 음성 사용량이 모두 소진되었습니다."))
+return
+if denial == "rate_limit":
+self.send_json(429, error_payload("rate_limit", "음성 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요."))
+return
+try:
+audio = asyncio.run(self.generate_edge_speech(text))
+if not audio:
+raise ValueError("empty speech response")
+self.send_response(200)
+self.send_header("Content-Type", "audio/mpeg")
+self.send_header("Content-Length", str(len(audio)))
+self.send_header("Cache-Control", "no-store")
+self.end_headers()
+self.wfile.write(audio)
+except HTTPError as exc:
+print(f"Edge TTS HTTP error {exc.code}", flush=True)
+self.send_json(502, error_payload("tts_provider_error", "음성 서비스 요청이 실패했습니다. 잠시 후 다시 시도해 주세요."))
+except Exception as exc:
+print(f"Edge TTS request failed: {type(exc).name}", flush=True)
+self.send_json(502, error_payload("tts_provider_error", "음성을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요."))
+def do_transcribe(self) -> None:
+if not GROQ_API_KEY:
+self.send_json(503, error_payload("server_error", "서버에 Groq API 키가 설정되지 않았습니다."))
+return
+try:
+length = int(self.headers.get("Content-Length", "0"))
+if length < 44 or length > 5 * 1024 * 1024:
+raise ValueError("invalid audio length")
+audio = self.rfile.read(length)
+if len(audio) != length or audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
+raise ValueError("invalid wav audio")
+except (ValueError, OverflowError):
+self.send_json(400, error_payload("invalid_audio", "녹음 파일이 올바르지 않습니다."))
+return
+boundary = "----UnityVoiceBoundary7MA4YWxkTrZu0gW"
+body = b"".join([
+f"--{boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-large-v3\r\n".encode("ascii"),
+f"--{boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nko\r\n".encode("ascii"),
+f"--{boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\njson\r\n".encode("ascii"),
+f"--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="voice.wav"\r\nContent-Type: audio/wav\r\n\r\n".encode("ascii"),
+audio,
+f"\r\n--{boundary}--\r\n".encode("ascii"),
+])
+req = Request("groq.com", data=body, headers={
+"Authorization": f"Bearer {GROQ_API_KEY}",
+"Content-Type": f"multipart/form-data; boundary={boundary}",
+"User-Agent": "UnityAI-Groq-Server/1.0",
+}, method="POST")
+try:
+with urlopen(req, timeout=60) as response:
+result = json.loads(response.read().decode("utf-8"))
+transcript = result.get("text", "") if isinstance(result, dict) else ""
+if not isinstance(transcript, str) or not transcript.strip():
+self.send_json(422, error_payload("empty_transcription", "말한 내용을 알아듣지 못했어요. 다시 말해 주세요."))
+return
+self.send_json(200, {"text": transcript.strip()})
+except HTTPError as exc:
+detail = ""
+raw_body = ""
+try:
+raw_body = exc.read().decode("utf-8", errors="replace")
+parsed = json.loads(raw_body)
+provider_error = parsed.get("error", parsed) if isinstance(parsed, dict) else parsed
+if isinstance(provider_error, dict):
+code = str(provider_error.get("code") or provider_error.get("type") or "")
+message = str(provider_error.get("message") or provider_error.get("detail") or "")
+detail = " ".join(part for part in (f"[{code}]" if code else "", message) if part)
+elif provider_error:
+detail = str(provider_error)
+except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError):
+detail = raw_body
+if GROQ_API_KEY:
+detail = detail.replace(GROQ_API_KEY, "[redacted]")
+detail = " ".join(detail.split())[:320]
+request_id = exc.headers.get("x-request-id", "") if exc.headers else ""
+if request_id and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id):
+detail += f" (request_id={request_id})"
+print(f"Groq transcription HTTP {exc.code}{(' ' + detail) if detail else ''}", flush=True)
+message = f"음성 인식 서비스 오류 (Groq HTTP {exc.code}{(' ' + detail) if detail else ''})"
+self.send_json(502, error_payload("transcription_error", message))
+except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError):
+self.send_json(502, error_payload("transcription_error", "음성을 글자로 바꾸지 못했습니다. 잠시 후 다시 시도해 주세요."))
+@staticmethod
+async def generate_edge_speech(text: str) -> bytes:
+communicate = edge_tts.Communicate(text, TTS_VOICE, rate="-15%")
+chunks = []
+async for chunk in communicate.stream():
+if chunk.get("type") == "audio":
+chunks.append(chunk["data"])
+return b"".join(chunks)
+if name == "main":
+init_db()
+host = os.getenv("HOST", "127.0.0.1")
+port = int(os.getenv("PORT", "8000"))
+print(f"AI server listening on {host}:{port}; model={MODEL}; timezone={TZ}")
+ThreadingHTTPServer((host, port), Handler).serve_forever()
