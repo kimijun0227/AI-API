@@ -138,10 +138,15 @@ def reserve_request(user_id: str) -> tuple[str | None, int]:
         conn.execute("INSERT OR IGNORE INTO global_minute(minute) VALUES (?)", (minute,))
         conn.execute("INSERT OR IGNORE INTO user_bonus(user_id, day) VALUES (?, ?)", (user_id, today))
         
-        user_used = conn.execute("SELECT used FROM user_daily WHERE user_id=? AND day=?", (user_id, today)).fetchone()[0]
-        global_used = conn.execute("SELECT used FROM global_daily WHERE day=?", (today,)).fetchone()[0]
-        minute_used = conn.execute("SELECT used FROM global_minute WHERE minute=?", (minute,)).fetchone()[0]
-        bonus_remaining = conn.execute("SELECT bonus_remaining FROM user_bonus WHERE user_id=? AND day=?", (user_id, today)).fetchone()[0]
+        user_used_row = conn.execute("SELECT used FROM user_daily WHERE user_id=? AND day=?", (user_id, today)).fetchone()
+        global_used_row = conn.execute("SELECT used FROM global_daily WHERE day=?", (today,)).fetchone()
+        minute_used_row = conn.execute("SELECT used FROM global_minute WHERE minute=?", (minute,)).fetchone()
+        bonus_row = conn.execute("SELECT bonus_remaining FROM user_bonus WHERE user_id=? AND day=?", (user_id, today)).fetchone()
+
+        user_used = user_used_row[0] if user_used_row else 0
+        global_used = global_used_row[0] if global_used_row else 0
+        minute_used = minute_used_row[0] if minute_used_row else 0
+        bonus_remaining = bonus_row[0] if bonus_row else 0
 
         if global_used >= GLOBAL_DAILY_LIMIT:
             conn.rollback()
