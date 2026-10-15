@@ -1,4 +1,4 @@
-"""Single-instance API server for the Unity AI client with Cloudflare Workers AI TTS."""
+"""Small single-instance API server for the Unity AI client with original Cloudflare-bridge specs."""
 from __future__ import annotations
 
 import json
@@ -7,7 +7,6 @@ import re
 import sqlite3
 import threading
 import time
-import asyncio
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,29 +19,15 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("AI_DB_PATH", str(ROOT / "ai_usage.sqlite3")))
 TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Asia/Seoul"))
-
 USER_DAILY_LIMIT = int(os.getenv("USER_DAILY_LIMIT", "10"))
 GLOBAL_DAILY_LIMIT = int(os.getenv("GLOBAL_DAILY_LIMIT", "1000"))
 GLOBAL_RPM_LIMIT = int(os.getenv("GLOBAL_RPM_LIMIT", "20"))
 MAX_QUESTION_CHARS = int(os.getenv("MAX_QUESTION_CHARS", "30"))
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "800"))
-
-TTS_DAILY_LIMIT = int(os.getenv("TTS_DAILY_LIMIT", "10"))
-TTS_GLOBAL_DAILY_LIMIT = int(os.getenv("TTS_GLOBAL_DAILY_LIMIT", "1000"))
-TTS_GLOBAL_RPM_LIMIT = int(os.getenv("TTS_GLOBAL_RPM_LIMIT", "20"))
-MAX_TTS_CHARS = int(os.getenv("MAX_TTS_CHARS", "2000"))
-
-MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
+MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_URL = "https://groq.com"
 
-# --- Cloudflare Workers AI 전용 환경 변수 구조 셋업 ---
-CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
-CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
-# Cloudflare에서 표준으로 서비스되는 한국어 지원 및 경량 오디오 음성 합성 주소 자동 맵핑
-CF_TTS_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/techosmart/melo-tts"
-
-TTS_IGNORED_CHARS = str.maketrans({char: " " for char in ".,!?/@*^$~`<>"})
 DB_LOCK = threading.Lock()
 INSTALL_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
@@ -59,6 +44,8 @@ OpenAI가 만들었다고 말하거나 자신을 OpenAI의 언어 모델이라�
   "visuals": ["화면에 순서대로 보여줄 짧은 단계"]
 }
 """.strip()
+
+
 def preprocess_tts_text(text: str) -> str:
     """Strip common display-only markup from the model's TTS field."""
     text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
@@ -102,25 +89,13 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS global_minute (
                 minute TEXT PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0
             );
-            CREATE TABLE IF NOT EXISTS tts_user_daily (
-                user_id TEXT NOT NULL, day TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (user_id, day)
-            );
-            CREATE TABLE IF NOT EXISTS tts_global_daily (
-                day TEXT PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS tts_global_minute (
-                minute TEXT PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0
-            );
             CREATE TABLE IF NOT EXISTS user_bonus (
                 user_id TEXT NOT NULL, day TEXT NOT NULL, bonus_remaining INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (user_id, day)
             );
         """)
-
-
 def reserve_request(user_id: str) -> tuple[str | None, int]:
-    """Atomically check and reserve a request before calling Groq. Fixed index mismatch."""
+    """Atomically check and reserve a request using original logic row factory."""
     today, minute = day_key(), minute_key()
     with DB_LOCK, connect_db() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -134,11 +109,10 @@ def reserve_request(user_id: str) -> tuple[str | None, int]:
         minute_row = conn.execute("SELECT used FROM global_minute WHERE minute=?", (minute,)).fetchone()
         bonus_row = conn.execute("SELECT bonus_remaining FROM user_bonus WHERE user_id=? AND day=?", (user_id, today)).fetchone()
 
-        # 인덱스 튜플 에러 발생 구역 완전 정형화 교정 완료
-        user_used = user_row[0] if user_row and isinstance(user_row, tuple) else (user_row["used"] if user_row else 0)
-        global_used = global_row[0] if global_row and isinstance(global_row, tuple) else (global_row["used"] if global_row else 0)
-        minute_used = minute_row[0] if minute_row and isinstance(minute_row, tuple) else (minute_row["used"] if minute_row else 0)
-        bonus_remaining = bonus_row[0] if bonus_row and isinstance(bonus_row, tuple) else (bonus_row["bonus_remaining"] if bonus_row else 0)
+        user_used = user_row["used"] if user_row else 0
+        global_used = global_row["used"] if global_row else 0
+        minute_used = minute_row["used"] if minute_row else 0
+        bonus_remaining = bonus_row["bonus_remaining"] if bonus_row else 0
 
         if global_used >= GLOBAL_DAILY_LIMIT:
             conn.rollback()
@@ -161,38 +135,6 @@ def reserve_request(user_id: str) -> tuple[str | None, int]:
         conn.execute("UPDATE global_minute SET used=used+1 WHERE minute=?", (minute,))
         conn.commit()
         return None, max(0, USER_DAILY_LIMIT - user_used - 1)
-def reserve_tts(user_id: str) -> str | None:
-    """Bound Azure/Cloudflare speech usage per install, globally per day, and per minute."""
-    today, minute = day_key(), minute_key()
-    with DB_LOCK, connect_db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute("INSERT OR IGNORE INTO tts_user_daily(user_id, day) VALUES (?, ?)", (user_id, today))
-        conn.execute("INSERT OR IGNORE INTO tts_global_daily(day) VALUES (?)", (today,))
-        conn.execute("INSERT OR IGNORE INTO tts_global_minute(minute) VALUES (?)", (minute,))
-        
-        user_used = conn.execute("SELECT used FROM tts_user_daily WHERE user_id=? AND day=?", (user_id, today)).fetchone()
-        global_used = conn.execute("SELECT used FROM tts_global_daily WHERE day=?", (today,)).fetchone()
-        minute_used = conn.execute("SELECT used FROM tts_global_minute WHERE minute=?", (minute,)).fetchone()
-        
-        u_val = user_used[0] if user_used and isinstance(user_used, tuple) else (user_used["used"] if user_used else 0)
-        g_val = global_used[0] if global_used and isinstance(global_used, tuple) else (global_used["used"] if global_used else 0)
-        m_val = minute_used[0] if minute_used and isinstance(minute_used, tuple) else (minute_used["used"] if minute_used else 0)
-        
-        if u_val >= TTS_DAILY_LIMIT:
-            conn.rollback()
-            return "user_limit"
-        if g_val >= TTS_GLOBAL_DAILY_LIMIT:
-            conn.rollback()
-            return "global_limit"
-        if m_val >= TTS_GLOBAL_RPM_LIMIT:
-            conn.rollback()
-            return "rate_limit"
-            
-        conn.execute("UPDATE tts_user_daily SET used=used+1 WHERE user_id=? AND day=?", (user_id, today))
-        conn.execute("UPDATE tts_global_daily SET used=used+1 WHERE day=?", (today,))
-        conn.execute("UPDATE tts_global_minute SET used=used+1 WHERE minute=?", (minute,))
-        conn.commit()
-        return None
 
 
 def add_user_bonus(user_id: str, amount: int = 5) -> None:
@@ -210,13 +152,11 @@ def get_user_bonus(user_id: str) -> int:
     today = day_key()
     with connect_db() as conn:
         row = conn.execute("SELECT bonus_remaining FROM user_bonus WHERE user_id=? AND day=?", (user_id, today)).fetchone()
-        return row[0] if row and isinstance(row, tuple) else (row["bonus_remaining"] if row else 0)
+        return row["bonus_remaining"] if row else 0
 
 
 def error_payload(code: str, message: str, remaining: int = -1, limit: int = USER_DAILY_LIMIT) -> dict:
     return {"error": code, "message": message, "remaining": remaining, "limit": limit}
-
-
 class Handler(BaseHTTPRequestHandler):
     server_version = "PersonalAI/1.0"
 
@@ -243,7 +183,7 @@ class Handler(BaseHTTPRequestHandler):
         query_params = parse_qs(parsed_url.query)
 
         if parsed_url.path == "/health":
-            self.send_json(200, {"ok": True, "tts_configured": True, "tts_provider": "cloudflare-workers-ai"})
+            self.send_json(200, {"ok": True})
             return
             
         elif parsed_url.path == "/admob/ssv":
@@ -281,13 +221,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self.send_json(404, {"error": "not_found", "message": "요청한 주소를 찾을 수 없습니다."})
+
     def do_POST(self) -> None:
-        if self.path == "/speak":
-            self.do_speak()
-            return
-        if self.path == "/transcribe":
-            self.do_transcribe()
-            return
         if self.path != "/ask":
             self.send_json(404, {"error": "not_found", "message": "요청한 주소를 찾을 수 없습니다."})
             return
@@ -301,9 +236,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length < 1 or length > 16_384: raise ValueError()
             body = json.loads(self.rfile.read(length).decode("utf-8"))
-        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        except Exception:
             self.send_json(400, error_payload("invalid_request", "요청 형식을 확인해 주세요."))
             return
 
@@ -347,7 +281,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with urlopen(req, timeout=30) as response:
                 result = json.loads(response.read().decode("utf-8"))
-            completion = result["choices"][0]["message"]["content"].strip()
+            completion = result["choices"]["message"]["content"].strip()
             if completion.startswith("```"):
                 completion = re.sub(r"^```(?:json)?\s*|\s*```$", "", completion, flags=re.IGNORECASE)
             try: parsed = json.loads(completion)
@@ -363,63 +297,6 @@ class Handler(BaseHTTPRequestHandler):
             })
         except Exception:
             self.send_json(502, error_payload("server_error", "답변을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.", remaining))
-
-    def do_speak(self) -> None:
-        install_id = self.headers.get("X-Install-Id", "").strip()
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(length).decode("utf-8"))
-            text = body.get("text", "").translate(TTS_IGNORED_CHARS).strip()
-            if not text or len(text) > MAX_TTS_CHARS or reserve_tts(install_id): raise ValueError()
-            
-            # --- Cloudflare Workers AI 전용 TTS API 호출 파이프라인 우회 구축 ---
-            cf_payload = json.dumps({"text": text, "lang": "ko"}).encode("utf-8")
-            cf_req = Request(CF_TTS_URL, data=cf_payload, headers={
-                "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
-                "Content-Type": "application/json"
-            }, method="POST")
-            
-            with urlopen(cf_req, timeout=30) as cf_res:
-                audio = cf_res.read()
-                
-            self.send_response(200)
-            self.send_header("Content-Type", "audio/mpeg")
-            self.send_header("Content-Length", str(len(audio)))
-            self.end_headers()
-            self.wfile.write(audio)
-        except Exception as e:
-            print(f"Cloudflare TTS failed: {e}", flush=True)
-            self.send_json(429, error_payload("rate_limit", "음성 처리량 제한 혹은 오류가 발생했습니다."))
-
-    def do_transcribe(self) -> None:
-        if not GROQ_API_KEY:
-            self.send_json(503, error_payload("server_error", "서버에 Groq API 키가 설정되지 않았습니다."))
-            return
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            audio = self.rfile.read(length)
-            if audio[:4] != b"RIFF" or audio[8:12] != b"WAVE": raise ValueError()
-        except Exception:
-            self.send_json(400, error_payload("invalid_audio", "녹음 파일이 올바르지 않습니다."))
-            return
-        boundary = "----UnityVoiceBoundary7MA4YWxkTrZu0gW"
-        body = b"".join([
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3\r\n".encode("ascii"),
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\nko\r\n".encode("ascii"),
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n".encode("ascii"),
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"voice.wav\"\r\nContent-Type: audio/wav\r\n\r\n".encode("ascii"),
-            audio, f"\r\n--{boundary}--\r\n".encode("ascii")
-        ])
-        req = Request("https://groq.com", data=body, headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "UnityAI-Groq-Server/1.0"
-        }, method="POST")
-        try:
-            with urlopen(req, timeout=60) as response:
-                result = json.loads(response.read().decode("utf-8"))
-            self.send_json(200, {"text": result.get("text", "").strip()})
-        except Exception:
-            self.send_json(502, error_payload("transcription_error", "음성을 글자로 바꾸지 못했습니다."))
 
 
 if __name__ == "__main__":
