@@ -1,107 +1,96 @@
-            ))
-            return
-        if denial == "rate_limit":
-            self.send_json(429, error_payload(
-                "rate_limit", "요청이 너무 많아요. 잠시 후 다시 시도해 주세요.", remaining
-            ))
-            return
-        if denial == "user_limit":
-            self.send_json(429, error_payload("user_limit", "오늘 사용할 수 있는 질문을 모두 사용했어요.", 0))
-            return
+"""Voice AI API server for Unity.
+Endpoints:
+  GET  /health
+  GET  /quota
+  GET  /admob/ssv?user_id=<install-id>
+  POST /ask          JSON: {"question": "..."}
+  POST /transcribe   raw WAV bytes (Content-Type: audio/wav), returns {"text": "..."}
+"""
 
-        payload = {
-            "model": MODEL,
-            "messages": [
-                {"role": "system", "content": VOICE_SYSTEM_PROMPT},
-                {"role": "user", "content": question},
-            ],
-            "max_completion_tokens": MAX_OUTPUT_TOKENS,
-            "temperature": 0.5,
-        }
-        req = Request(
-            GROQ_CHAT_URL,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-                "User-Agent": "VoiceAI-Groq-Server/1.1",
-            },
-            method="POST",
-        )
+from __future__ import annotations
 
-        try:
-            with urlopen(req, timeout=60) as response:
-                result = json.loads(response.read().decode("utf-8"))
+import json
+import os
+import re
+import sqlite3
+import threading
+import time
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
-            choices = result.get("choices", [])
-            if not choices or not isinstance(choices[0], dict):
-                raise ValueError("Groq response did not contain choices[0]")
-            message = choices[0].get("message", {})
-            completion = message.get("content", "")
-            if not isinstance(completion, str) or not completion.strip():
-                raise ValueError("Groq response content was empty")
-            completion = completion.strip()
+ROOT = Path(__file__).resolve().parent
+DB_PATH = Path(os.getenv("AI_DB_PATH", str(ROOT / "ai_usage.sqlite3")))
+TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Asia/Seoul"))
 
-            if completion.startswith("```"):
-                completion = re.sub(
-                    r"^```(?:json)?\s*|\s*```$", "", completion, flags=re.IGNORECASE
-                ).strip()
+USER_DAILY_LIMIT = int(os.getenv("USER_DAILY_LIMIT", "10"))
+GLOBAL_DAILY_LIMIT = int(os.getenv("GLOBAL_DAILY_LIMIT", "1000"))
+GLOBAL_RPM_LIMIT = int(os.getenv("GLOBAL_RPM_LIMIT", "20"))
+# The old default of 30 characters rejected many normal questions.
+MAX_QUESTION_CHARS = int(os.getenv("MAX_QUESTION_CHARS", "1000"))
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "800"))
+MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", str(25 * 1024 * 1024)))
 
-            try:
-                parsed = json.loads(completion)
-            except json.JSONDecodeError:
-                parsed = {"answer": completion}
+MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 
-            if not isinstance(parsed, dict):
-                parsed = {"answer": completion}
-            answer = parsed.get("answer", completion)
-            tts_text = parsed.get("tts", answer)
-            visual_steps = parsed.get("visuals", [])
-            if not isinstance(answer, str):
-                answer = str(answer)
-            if not isinstance(tts_text, str):
-                tts_text = answer
-            if not isinstance(visual_steps, list):
-                visual_steps = []
+DB_LOCK = threading.Lock()
+INSTALL_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
-            visuals = [
-                preprocess_tts_text(step)[:100]
-                for step in visual_steps
-                if isinstance(step, str)
-            ]
-            visuals = [item for item in visuals if item][:4]
+VOICE_SYSTEM_PROMPT = """
+당신은 친절하고 존중하는 한국어 AI 도우미이며 이름은 보이스입니다.
+정체를 물으면 '저는 당신의 개인 언어 모델 보이스입니다.'라고 답하세요.
+불확실한 내용은 확실하지 않다고 말하고, 사용자를 욕하거나 비하하지 말며 간결하게 답하세요.
 
-            self.send_json(200, {
-                "answer": answer.strip(),
-                "tts": preprocess_tts_text(tts_text),
-                "visuals": visuals,
-                "remaining": remaining,
-                "limit": USER_DAILY_LIMIT,
-            })
-        except HTTPError as exc:
-            print(f"Groq chat request failed: {groq_error_details(exc)}", flush=True)
-            self.send_json(502, error_payload(
-                "server_error", "AI 제공자 요청에 실패했습니다. Render 로그를 확인해 주세요.", remaining
-            ))
-        except (URLError, TimeoutError, json.JSONDecodeError, OSError, ValueError, KeyError) as exc:
-            print(f"Groq chat request failed: {groq_error_details(exc)}", flush=True)
-            self.send_json(502, error_payload(
-                "server_error", "답변을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.", remaining
-            ))
-        except Exception as exc:
-            print(f"Unexpected chat error: {exc!r}", flush=True)
-            self.send_json(502, error_payload(
-                "server_error", "답변을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.", remaining
-            ))
+반드시 아래 형식의 JSON 객체 하나만 응답하세요. 코드 펜스나 JSON 바깥 설명은 쓰지 마세요.
+{
+  "answer": "사용자에게 할 원래 답변",
+  "tts": "음성으로 읽을 전처리 문장",
+  "visuals": ["화면에 순서대로 보여줄 짧은 단계"]
+}
+""".strip()
 
 
-if __name__ == "__main__":
-    init_db()
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
-    print(
-        f"Voice AI server listening on {host}:{port}; model={MODEL}; "
-        f"transcription_model={TRANSCRIPTION_MODEL}",
-        flush=True,
-    )
-    ThreadingHTTPServer((host, port), Handler).serve_forever()
+def preprocess_tts_text(text: str) -> str:
+    """Remove display-only markup from text that will be spoken aloud."""
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"https?://\S+|www\.\S+", "", text)
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
+    text = re.sub(r"(?m)^\s*[-+*•]\s+", "", text)
+    text = re.sub(r"(?m)^\s*\d+[.)]\s+", "", text)
+    text = re.sub(r"[*_`#\[\]{}]", "", text)
+    text = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF]", "", text)
+    return " ".join(text.split())
+
+
+def day_key() -> str:
+    return datetime.now(TZ).strftime("%Y-%m-%d")
+
+
+def minute_key() -> str:
+    return str(int(time.time() // 60))
+
+
+def connect_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
+    return conn
+
+
+def init_db() -> None:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with connect_db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS user_daily (
+                user_id TEXT NOT NULL, day TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, day)
