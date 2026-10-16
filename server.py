@@ -94,3 +94,398 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS user_daily (
                 user_id TEXT NOT NULL, day TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (user_id, day)
+            );
+            CREATE TABLE IF NOT EXISTS global_daily (
+                day TEXT PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS global_minute (
+                minute TEXT PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS user_bonus (
+                user_id TEXT NOT NULL, day TEXT NOT NULL, bonus_remaining INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, day)
+            );
+        """)
+
+
+def reserve_request(user_id: str) -> tuple[str | None, int]:
+    """Atomically check and reserve a question against existing usage limits."""
+    today, minute = day_key(), minute_key()
+    with DB_LOCK, connect_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT OR IGNORE INTO user_daily(user_id, day) VALUES (?, ?)", (user_id, today))
+        conn.execute("INSERT OR IGNORE INTO global_daily(day) VALUES (?)", (today,))
+        conn.execute("INSERT OR IGNORE INTO global_minute(minute) VALUES (?)", (minute,))
+        conn.execute("INSERT OR IGNORE INTO user_bonus(user_id, day) VALUES (?, ?)", (user_id, today))
+
+        user_row = conn.execute(
+            "SELECT used FROM user_daily WHERE user_id=? AND day=?", (user_id, today)
+        ).fetchone()
+        global_row = conn.execute("SELECT used FROM global_daily WHERE day=?", (today,)).fetchone()
+        minute_row = conn.execute("SELECT used FROM global_minute WHERE minute=?", (minute,)).fetchone()
+        bonus_row = conn.execute(
+            "SELECT bonus_remaining FROM user_bonus WHERE user_id=? AND day=?", (user_id, today)
+        ).fetchone()
+
+        user_used = user_row["used"] if user_row else 0
+        global_used = global_row["used"] if global_row else 0
+        minute_used = minute_row["used"] if minute_row else 0
+        bonus_remaining = bonus_row["bonus_remaining"] if bonus_row else 0
+
+        if global_used >= GLOBAL_DAILY_LIMIT:
+            conn.rollback()
+            return "global_limit", max(0, USER_DAILY_LIMIT - user_used)
+        if minute_used >= GLOBAL_RPM_LIMIT:
+            conn.rollback()
+            return "rate_limit", max(0, USER_DAILY_LIMIT - user_used)
+        if user_used >= USER_DAILY_LIMIT:
+            if bonus_remaining > 0:
+                conn.execute(
+                    "UPDATE user_bonus SET bonus_remaining=bonus_remaining-1 WHERE user_id=? AND day=?",
+                    (user_id, today),
+                )
+                conn.commit()
+                return None, bonus_remaining - 1
+            conn.rollback()
+            return "user_limit", 0
+
+        conn.execute("UPDATE user_daily SET used=used+1 WHERE user_id=? AND day=?", (user_id, today))
+        conn.execute("UPDATE global_daily SET used=used+1 WHERE day=?", (today,))
+        conn.execute("UPDATE global_minute SET used=used+1 WHERE minute=?", (minute,))
+        conn.commit()
+        return None, max(0, USER_DAILY_LIMIT - user_used - 1)
+
+
+def add_user_bonus(user_id: str, amount: int = 5) -> None:
+    today = day_key()
+    with DB_LOCK, connect_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT OR IGNORE INTO user_bonus(user_id, day) VALUES (?, ?)", (user_id, today))
+        conn.execute(
+            "UPDATE user_bonus SET bonus_remaining=bonus_remaining+? WHERE user_id=? AND day=?",
+            (amount, user_id, today),
+        )
+        conn.commit()
+
+
+def get_user_bonus(user_id: str) -> int:
+    today = day_key()
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT bonus_remaining FROM user_bonus WHERE user_id=? AND day=?", (user_id, today)
+        ).fetchone()
+        return row["bonus_remaining"] if row else 0
+
+
+def error_payload(code: str, message: str, remaining: int = -1,
+                  limit: int = USER_DAILY_LIMIT) -> dict:
+    return {"error": code, "message": message, "remaining": remaining, "limit": limit}
+
+
+def groq_error_details(exc: Exception) -> str:
+    """Return a bounded diagnostic string for server logs only."""
+    if isinstance(exc, HTTPError):
+        try:
+            body = exc.read(2000).decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        return f"HTTP {exc.code}: {body}"
+    return repr(exc)
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "VoiceAI/1.1"
+
+    def log_message(self, fmt: str, *args) -> None:
+        print(f"{self.log_date_time_string()} {self.address_string()} {fmt % args}", flush=True)
+
+    def send_json(self, status: int, payload: dict) -> None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def read_body(self, max_bytes: int) -> bytes:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise ValueError("invalid_content_length")
+        if length <= 0:
+            raise ValueError("empty_body")
+        if length > max_bytes:
+            raise OverflowError("body_too_large")
+        body = self.rfile.read(length)
+        if len(body) != length:
+            raise ValueError("incomplete_body")
+        return body
+
+    def do_HEAD(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+
+        if parsed.path == "/health":
+            self.send_json(200, {"ok": True})
+            return
+
+        if parsed.path == "/admob/ssv":
+            user_ids = query.get("user_id", [])
+            if not user_ids:
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            install_id = user_ids[0].strip()
+            if not INSTALL_ID_RE.fullmatch(install_id):
+                self.send_json(400, {"error": "invalid_user"})
+                return
+            try:
+                add_user_bonus(install_id, 5)
+                print(f"AdMob SSV credited 5 questions to install ID {install_id}", flush=True)
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            except sqlite3.Error as exc:
+                print(f"AdMob database error: {exc!r}", flush=True)
+                self.send_json(500, {"error": "database_error"})
+            return
+
+        if parsed.path == "/quota":
+            install_id = self.headers.get("X-Install-Id", "").strip()
+            if not INSTALL_ID_RE.fullmatch(install_id):
+                self.send_json(400, {"error": "invalid_user"})
+                return
+            try:
+                self.send_json(200, {"bonus_remaining": get_user_bonus(install_id)})
+            except sqlite3.Error as exc:
+                print(f"Quota database error: {exc!r}", flush=True)
+                self.send_json(500, {"error": "database_error"})
+            return
+
+        self.send_json(404, {"error": "not_found", "message": "요청한 주소를 찾을 수 없습니다."})
+
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/transcribe":
+            self.handle_transcribe()
+        elif path == "/ask":
+            self.handle_ask()
+        else:
+            self.send_json(404, {"error": "not_found", "message": "요청한 주소를 찾을 수 없습니다."})
+
+    def handle_transcribe(self) -> None:
+        if not GROQ_API_KEY:
+            self.send_json(503, {"error": "server_error", "message": "서버에 Groq API 키가 설정되지 않았습니다."})
+            return
+
+        content_type = self.headers.get("Content-Type", "").lower()
+        if "audio/wav" not in content_type and "application/octet-stream" not in content_type:
+            self.send_json(415, {"error": "unsupported_audio", "message": "WAV 음성 파일을 보내 주세요."})
+            return
+
+        try:
+            audio = self.read_body(MAX_AUDIO_BYTES)
+        except OverflowError:
+            self.send_json(413, {"error": "audio_too_large", "message": "음성 파일이 너무 큽니다."})
+            return
+        except ValueError:
+            self.send_json(400, {"error": "invalid_audio", "message": "음성 파일이 비어 있거나 올바르지 않습니다."})
+            return
+
+        # Unity sends raw WAV bytes. Groq expects multipart/form-data, so wrap the
+        # bytes in a multipart body here rather than expecting Unity to do it.
+        boundary = "----VoiceAIFormBoundary7MA4YWxkTrZu0gW"
+        multipart = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="model"\r\n\r\n'
+            f"{TRANSCRIPTION_MODEL}\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="language"\r\n\r\n'
+            "ko\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="response_format"\r\n\r\n'
+            "json\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="file"; filename="voice.wav"\r\n'
+            "Content-Type: audio/wav\r\n\r\n"
+        ).encode("utf-8") + audio + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        req = Request(
+            GROQ_TRANSCRIPTION_URL,
+            data=multipart,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "User-Agent": "VoiceAI-Groq-Server/1.1",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=60) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            text = result.get("text", "")
+            if not isinstance(text, str) or not text.strip():
+                self.send_json(502, {"error": "transcription_empty", "message": "음성을 인식하지 못했습니다."})
+                return
+            self.send_json(200, {"text": text.strip()})
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+            print(f"Groq transcription failed: {groq_error_details(exc)}", flush=True)
+            self.send_json(502, {"error": "transcription_failed", "message": "음성 인식에 실패했습니다. 잠시 후 다시 시도해 주세요."})
+        except Exception as exc:
+            print(f"Unexpected transcription error: {exc!r}", flush=True)
+            self.send_json(502, {"error": "transcription_failed", "message": "음성 인식에 실패했습니다. 잠시 후 다시 시도해 주세요."})
+
+    def handle_ask(self) -> None:
+        if not GROQ_API_KEY:
+            self.send_json(503, error_payload("server_error", "서버에 Groq API 키가 설정되지 않았습니다."))
+            return
+
+        install_id = self.headers.get("X-Install-Id", "").strip()
+        if not INSTALL_ID_RE.fullmatch(install_id):
+            self.send_json(400, error_payload("invalid_user", "앱 식별 정보가 올바르지 않습니다."))
+            return
+
+        try:
+            raw = self.read_body(1024 * 1024)
+            body = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self.send_json(400, error_payload("invalid_request", "요청 형식을 확인해 주세요."))
+            return
+
+        question = body.get("question") if isinstance(body, dict) else None
+        if not isinstance(question, str) or not question.strip():
+            self.send_json(400, error_payload("invalid_request", "질문을 입력해 주세요."))
+            return
+
+        question = question.strip()
+        if len(question) > MAX_QUESTION_CHARS:
+            self.send_json(400, error_payload(
+                "too_long", f"질문은 {MAX_QUESTION_CHARS}자까지만 보낼 수 있어요."
+            ))
+            return
+
+        try:
+            denial, remaining = reserve_request(install_id)
+        except sqlite3.Error as exc:
+            print(f"Usage database error: {exc!r}", flush=True)
+            self.send_json(503, error_payload("server_error", "사용량 저장소에 문제가 생겼습니다."))
+            return
+
+        if denial == "global_limit":
+            self.send_json(429, error_payload(
+                "global_limit", "오늘 AI 사용량이 모두 소진되었습니다. 내일 다시 이용해 주세요.", remaining
+            ))
+            return
+        if denial == "rate_limit":
+            self.send_json(429, error_payload(
+                "rate_limit", "요청이 너무 많아요. 잠시 후 다시 시도해 주세요.", remaining
+            ))
+            return
+        if denial == "user_limit":
+            self.send_json(429, error_payload("user_limit", "오늘 사용할 수 있는 질문을 모두 사용했어요.", 0))
+            return
+
+        payload = {
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": VOICE_SYSTEM_PROMPT},
+                {"role": "user", "content": question},
+            ],
+            "max_completion_tokens": MAX_OUTPUT_TOKENS,
+            "temperature": 0.5,
+        }
+        req = Request(
+            GROQ_CHAT_URL,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+                "User-Agent": "VoiceAI-Groq-Server/1.1",
+            },
+            method="POST",
+        )
+
+        try:
+            with urlopen(req, timeout=60) as response:
+                result = json.loads(response.read().decode("utf-8"))
+
+            choices = result.get("choices", [])
+            if not choices or not isinstance(choices[0], dict):
+                raise ValueError("Groq response did not contain choices[0]")
+            message = choices[0].get("message", {})
+            completion = message.get("content", "")
+            if not isinstance(completion, str) or not completion.strip():
+                raise ValueError("Groq response content was empty")
+            completion = completion.strip()
+
+            if completion.startswith("```"):
+                completion = re.sub(
+                    r"^```(?:json)?\s*|\s*```$", "", completion, flags=re.IGNORECASE
+                ).strip()
+
+            try:
+                parsed = json.loads(completion)
+            except json.JSONDecodeError:
+                parsed = {"answer": completion}
+
+            if not isinstance(parsed, dict):
+                parsed = {"answer": completion}
+            answer = parsed.get("answer", completion)
+            tts_text = parsed.get("tts", answer)
+            visual_steps = parsed.get("visuals", [])
+            if not isinstance(answer, str):
+                answer = str(answer)
+            if not isinstance(tts_text, str):
+                tts_text = answer
+            if not isinstance(visual_steps, list):
+                visual_steps = []
+
+            visuals = [
+                preprocess_tts_text(step)[:100]
+                for step in visual_steps
+                if isinstance(step, str)
+            ]
+            visuals = [item for item in visuals if item][:4]
+
+            self.send_json(200, {
+                "answer": answer.strip(),
+                "tts": preprocess_tts_text(tts_text),
+                "visuals": visuals,
+                "remaining": remaining,
+                "limit": USER_DAILY_LIMIT,
+            })
+        except HTTPError as exc:
+            print(f"Groq chat request failed: {groq_error_details(exc)}", flush=True)
+            self.send_json(502, error_payload(
+                "server_error", "AI 제공자 요청에 실패했습니다. Render 로그를 확인해 주세요.", remaining
+            ))
+        except (URLError, TimeoutError, json.JSONDecodeError, OSError, ValueError, KeyError) as exc:
+            print(f"Groq chat request failed: {groq_error_details(exc)}", flush=True)
+            self.send_json(502, error_payload(
+                "server_error", "답변을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.", remaining
+            ))
+        except Exception as exc:
+            print(f"Unexpected chat error: {exc!r}", flush=True)
+            self.send_json(502, error_payload(
+                "server_error", "답변을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.", remaining
+            ))
+
+
+if __name__ == "__main__":
+    init_db()
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8000"))
+    print(
+        f"Voice AI server listening on {host}:{port}; model={MODEL}; "
+        f"transcription_model={TRANSCRIPTION_MODEL}",
+        flush=True,
+    )
+    ThreadingHTTPServer((host, port), Handler).serve_forever()
