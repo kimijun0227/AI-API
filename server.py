@@ -36,7 +36,7 @@ MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "800"))
 MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", str(25 * 1024 * 1024)))
 
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
-TRANSCRIPTION_MODEL = "whisper-large-v3"  # Force the allowed Groq transcription model
+TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -133,6 +133,12 @@ def reserve_request(user_id: str) -> tuple[str | None, int]:
         bonus_remaining = bonus_row["bonus_remaining"] if bonus_row else 0
 
         if global_used >= GLOBAL_DAILY_LIMIT:
+            print(
+                f"Global daily limit reached: used={global_used}, "
+                f"limit={GLOBAL_DAILY_LIMIT}, user_used={user_used}, "
+                f"user_limit={USER_DAILY_LIMIT}",
+                flush=True,
+            )
             conn.rollback()
             return "global_limit", max(0, USER_DAILY_LIMIT - user_used)
         if minute_used >= GLOBAL_RPM_LIMIT:
@@ -381,7 +387,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if denial == "global_limit":
             self.send_json(429, error_payload(
-                "global_limit", "오늘 AI 사용량이 모두 소진되었습니다. 내일 다시 이용해 주세요.", remaining
+                "global_limit",
+                "오늘 AI 전체 사용량이 모두 소진되었습니다. 내일 다시 이용해 주세요.",
+                remaining,
+                limit=GLOBAL_DAILY_LIMIT,
             ))
             return
         if denial == "rate_limit":
