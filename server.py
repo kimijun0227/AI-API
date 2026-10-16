@@ -400,7 +400,7 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
-        payload = {"prompt": text, "lang": "ko"}
+        payload = {"prompt": text, "lang": "kr"}
         req = Request(
             CLOUDFLARE_TTS_URL,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
