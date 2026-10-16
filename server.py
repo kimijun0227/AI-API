@@ -5,10 +5,12 @@ Endpoints:
   GET  /admob/ssv?user_id=<install-id>
   POST /ask          JSON: {"question": "..."}
   POST /transcribe   raw WAV bytes (Content-Type: audio/wav), returns {"text": "..."}
+  POST /speak        JSON {"text": "..."}, returns Cloudflare MeloTTS MP3 audio
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -34,12 +36,21 @@ GLOBAL_RPM_LIMIT = int(os.getenv("GLOBAL_RPM_LIMIT", "20"))
 MAX_QUESTION_CHARS = int(os.getenv("MAX_QUESTION_CHARS", "1000"))
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "800"))
 MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", str(25 * 1024 * 1024)))
+MAX_TTS_TEXT_CHARS = int(os.getenv("MAX_TTS_TEXT_CHARS", "3000"))
 
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+CLOUDFLARE_TTS_MODEL = "@cf/myshell-ai/melotts"
+CLOUDFLARE_TTS_URL = (
+    f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CLOUDFLARE_TTS_MODEL}"
+    if CLOUDFLARE_ACCOUNT_ID else ""
+)
 
 DB_LOCK = threading.Lock()
 INSTALL_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -205,6 +216,14 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:
         print(f"{self.log_date_time_string()} {self.address_string()} {fmt % args}", flush=True)
 
+    def send_audio(self, status: int, audio: bytes, content_type: str = "audio/mpeg") -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(audio)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(audio)
+
     def send_json(self, status: int, payload: dict) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -284,6 +303,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_transcribe()
         elif path == "/ask":
             self.handle_ask()
+        elif path == "/speak":
+            self.handle_speak()
         else:
             self.send_json(404, {"error": "not_found", "message": "요청한 주소를 찾을 수 없습니다."})
 
@@ -348,6 +369,90 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             print(f"Unexpected transcription error: {exc!r}", flush=True)
             self.send_json(502, {"error": "transcription_failed", "message": "음성 인식에 실패했습니다. 잠시 후 다시 시도해 주세요."})
+
+
+    def handle_speak(self) -> None:
+        """Generate Korean MP3 speech with Cloudflare Workers AI MeloTTS."""
+        if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
+            self.send_json(503, {
+                "error": "tts_not_configured",
+                "message": "서버에 Cloudflare TTS 설정이 없습니다."
+            })
+            return
+
+        try:
+            raw = self.read_body(1024 * 1024)
+            body = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self.send_json(400, {"error": "invalid_request", "message": "음성 요청 형식을 확인해 주세요."})
+            return
+
+        text = body.get("text") if isinstance(body, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            self.send_json(400, {"error": "invalid_text", "message": "읽을 문장을 입력해 주세요."})
+            return
+
+        text = text.strip()
+        if len(text) > MAX_TTS_TEXT_CHARS:
+            self.send_json(400, {
+                "error": "text_too_long",
+                "message": f"음성으로 변환할 문장은 {MAX_TTS_TEXT_CHARS}자 이하여야 합니다."
+            })
+            return
+
+        payload = {"prompt": text, "lang": "ko"}
+        req = Request(
+            CLOUDFLARE_TTS_URL,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg, application/json",
+                "User-Agent": "VoiceAI-Cloudflare-TTS/1.0",
+            },
+            method="POST",
+        )
+
+        try:
+            with urlopen(req, timeout=90) as response:
+                audio_or_json = response.read(20 * 1024 * 1024)
+                content_type = (response.headers.get("Content-Type") or "").lower()
+
+            # Workers AI may return raw audio/mpeg or a JSON envelope with base64 audio.
+            if content_type.startswith("audio/"):
+                audio = audio_or_json
+            else:
+                result = json.loads(audio_or_json.decode("utf-8"))
+                if result.get("success") is False:
+                    raise ValueError(f"Cloudflare Workers AI reported errors: {result.get('errors', [])}")
+                result_body = result.get("result", result)
+                encoded = result_body.get("audio") if isinstance(result_body, dict) else None
+                if not isinstance(encoded, str) or not encoded:
+                    raise ValueError("Cloudflare response did not contain audio data")
+                audio = base64.b64decode(encoded, validate=True)
+
+            if not audio:
+                raise ValueError("Cloudflare TTS returned empty audio")
+            self.send_audio(200, audio, "audio/mpeg")
+        except HTTPError as exc:
+            details = groq_error_details(exc)
+            print(f"Cloudflare MeloTTS failed: {details}", flush=True)
+            self.send_json(502, {
+                "error": "tts_provider_failed",
+                "message": "음성 생성 서비스 요청에 실패했습니다. Render 로그를 확인해 주세요."
+            })
+        except (URLError, TimeoutError, json.JSONDecodeError, OSError, ValueError) as exc:
+            print(f"Cloudflare MeloTTS failed: {exc!r}", flush=True)
+            self.send_json(502, {
+                "error": "tts_failed",
+                "message": "음성을 생성하지 못했습니다. 잠시 후 다시 시도해 주세요."
+            })
+        except Exception as exc:
+            print(f"Unexpected Cloudflare MeloTTS error: {exc!r}", flush=True)
+            self.send_json(502, {
+                "error": "tts_failed",
+                "message": "음성을 생성하지 못했습니다. 잠시 후 다시 시도해 주세요."
+            })
 
     def handle_ask(self) -> None:
         if not GROQ_API_KEY:
@@ -494,7 +599,8 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     print(
         f"Voice AI server listening on {host}:{port}; model={MODEL}; "
-        f"transcription_model={TRANSCRIPTION_MODEL}",
+        f"transcription_model={TRANSCRIPTION_MODEL}; "
+        f"tts_model={CLOUDFLARE_TTS_MODEL}; tts_configured={bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN)}",
         flush=True,
     )
     ThreadingHTTPServer((host, port), Handler).serve_forever()
