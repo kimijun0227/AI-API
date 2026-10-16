@@ -418,8 +418,8 @@ class Handler(BaseHTTPRequestHandler):
                 audio_or_json = response.read(20 * 1024 * 1024)
                 content_type = (response.headers.get("Content-Type") or "").lower()
 
-            # Workers AI may return raw audio/mpeg or a JSON envelope with base64 audio.
-            if content_type.startswith("audio/"):
+            # Workers AI may return raw audio or a JSON envelope with base64 audio.
+            if content_type.startswith("audio/") or audio_or_json.startswith((b"RIFF", b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")):
                 audio = audio_or_json
             else:
                 result = json.loads(audio_or_json.decode("utf-8"))
@@ -433,7 +433,14 @@ class Handler(BaseHTTPRequestHandler):
 
             if not audio:
                 raise ValueError("Cloudflare TTS returned empty audio")
-            self.send_audio(200, audio, "audio/mpeg")
+            # Match the response MIME type to the actual container signature.
+            if audio.startswith(b"RIFF") and audio[8:12] == b"WAVE":
+                output_type = "audio/wav"
+            elif audio.startswith(b"ID3") or audio.startswith((b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")):
+                output_type = "audio/mpeg"
+            else:
+                output_type = "application/octet-stream"
+            self.send_audio(200, audio, output_type)
         except HTTPError as exc:
             details = groq_error_details(exc)
             print(f"Cloudflare MeloTTS failed: {details}", flush=True)
